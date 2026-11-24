@@ -1,0 +1,42 @@
+name: Dependabot auto-merge
+
+# Base image (nginx, golang) and Go module updates are merged automatically
+# once CI passes, then a release is triggered. This is what keeps security
+# releases from waiting on a human.
+#
+# GitHub Actions updates are NOT auto-merged: the GITHUB_TOKEN cannot change
+# workflow files, and action bumps deserve a human look anyway.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    uses: ./.github/workflows/ci.yml
+
+  merge:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - name: Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+      - name: Merge and release
+        if: >-
+          contains(fromJSON('["docker", "go_modules"]'), steps.meta.outputs.package-ecosystem) &&
+          steps.meta.outputs.update-type != 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr merge "$PR_URL" --squash --delete-branch
+          # Merges made with GITHUB_TOKEN do not trigger push workflows.
+          gh workflow run release.yml --repo "$REPO" --ref main
