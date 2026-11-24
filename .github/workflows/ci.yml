@@ -40,7 +40,6 @@ jobs:
         with:
           context: .
           load: true
-          pull: true
           tags: nginx-proxy:test
           cache-from: type=gha
           cache-to: type=gha,mode=max

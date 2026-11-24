@@ -16,9 +16,10 @@ existing setups move over by switching the image. The implementation is new:
   before reload. If the check fails, the running configuration stays and the
   error is logged. When a single host is the cause, only that host is left
   out and all others keep being updated.
-- **Fast security updates.** Base-image and Go dependency updates are merged
-  automatically once the full test suite passes. The image is also rebuilt
-  daily on the latest base image layers.
+- **Reviewed and signed releases.** Base images are pinned by digest. Every
+  update to them or to a Go dependency arrives as a pull request that runs
+  the full test suite and is merged by a maintainer. Every published image
+  is signed.
 
 ```
 ghcr.io/alexvikman/nginx-proxy:latest
@@ -201,6 +202,8 @@ instead.
 
 ## Security
 
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
+
 **Trust.** The proxy's environment and the files mounted into it are trusted.
 A container the proxy sees is trusted to serve the hosts it announces, and to
 get certificates for them, but not to write nginx configuration. If not
@@ -265,17 +268,32 @@ strictly (see [Proxied containers](#proxied-containers)), an unknown
 ## Releases and updates
 
 Images are published to GitHub Container Registry for `linux/amd64` and
-`linux/arm64`, with SBOM and provenance attestations.
+`linux/arm64`, with SBOM and provenance attestations, and signed with
+[cosign](https://github.com/sigstore/cosign).
 
 | Tag | Updated |
 |---|---|
-| `latest` | every merge to `main`, and daily on the newest base image |
+| `latest` | every merge to `main` |
 | `sha-<commit>` | every build |
 | `<version>`, `<major>.<minor>` | on `v*` git tags |
 
-Dependabot checks the nginx and Go base images and Go modules daily. Patch
-and minor updates are merged automatically once the unit, end-to-end and
-ACME tests pass, and a new image is published right away.
+Dependabot checks the nginx and Go base images and Go modules daily and
+opens a pull request for each update. The unit, end-to-end and ACME tests run
+on it, and a maintainer reviews and merges it: nothing is merged
+automatically. A merge publishes a new image right away.
+
+The nginx and Go base images are pinned by digest in the `Dockerfile`, so
+an image tag that is published again with new content, for instance with
+patched Alpine packages, also arrives as a pull request. There is no
+scheduled rebuild: what an image contains was reviewed.
+
+To check that an image was built by this repository's release workflow:
+
+```bash
+cosign verify ghcr.io/alexvikman/nginx-proxy:latest \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/alexvikman/nginx-proxy/\.github/workflows/release\.yml@refs/(heads/main|tags/v.+)$'
+```
 
 ## Development
 

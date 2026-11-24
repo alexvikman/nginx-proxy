@@ -4,16 +4,17 @@ name: Release
 #
 # - every push to main publishes :latest and :sha-<commit>
 # - a v* tag publishes :<version> and :<major>.<minor>
-# - a daily rebuild republishes :latest on top of the newest base image, so
-#   security fixes in nginx/Alpine reach the image within a day without any
-#   code change
+#
+# Every published image is signed with cosign. Nothing is merged
+# automatically, and the base images are pinned by digest: what reaches main,
+# and so a release, was merged by a person. There is no scheduled rebuild for
+# that reason. A security fix in nginx or Alpine arrives as a Dependabot pull
+# request that updates the digest.
 on:
   push:
     branches: [main]
     tags: ["v*.*.*"]
     paths-ignore: ["**.md", "LICENSE"]
-  schedule:
-    - cron: "17 4 * * *"
   workflow_dispatch:
 
 permissions:
@@ -34,6 +35,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Keyless signing: the signature is bound to this workflow's identity
+      # by a short-lived certificate, so there is no signing key to protect.
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -67,8 +71,6 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          # Always resolve the newest base image digest for the pinned tag.
-          pull: true
           push: true
           sbom: true
           provenance: mode=max
@@ -80,5 +82,17 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
+
+      # Signs the multi-platform index that every tag pushed above points to,
+      # and with it the SBOM and provenance attached to it. README.md shows
+      # how to verify the signature.
+      - name: Sign image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/${GITHUB_REPOSITORY,,}@${DIGEST}"
+
       - name: Digest
-        run: echo "Published ${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: echo "Published and signed $DIGEST" >> "$GITHUB_STEP_SUMMARY"
