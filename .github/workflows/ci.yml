@@ -29,6 +29,32 @@ jobs:
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
 
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    env:
+      # Pinned with the checksum from the release's checksums.txt, so a
+      # replaced release asset fails the job instead of running. Dependabot
+      # does not track this: update both lines together.
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The whole history: a secret removed in a later commit is still
+          # published in the earlier one.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks
+        run: |
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$archive" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$archive"
+          echo "$GITLEAKS_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+      - name: gitleaks
+        # --redact keeps a found secret out of the public job log.
+        run: '"$RUNNER_TEMP/gitleaks" git --redact --no-banner --log-opts=--all .'
+
   e2e:
     name: End-to-end tests
     runs-on: ubuntu-latest
