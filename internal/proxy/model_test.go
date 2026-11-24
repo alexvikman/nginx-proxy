@@ -241,6 +241,11 @@ func TestContainerValuesAreValidated(t *testing.T) {
 		"regex VIRTUAL_PATH escape":  base(map[string]string{"VIRTUAL_PATH": `~^/x\`}, nil),
 		"VIRTUAL_DEST backslash":     base(map[string]string{"VIRTUAL_DEST": `/\`}, nil),
 		"VIRTUAL_ROOT backslash":     base(map[string]string{"VIRTUAL_ROOT": `/www\`}, nil),
+		"VIRTUAL_DEST other host":    base(map[string]string{"VIRTUAL_DEST": ".evil.test/"}, nil),
+		"VIRTUAL_DEST port":          base(map[string]string{"VIRTUAL_DEST": ":8080/"}, nil),
+		"VIRTUAL_DEST variable":      base(map[string]string{"VIRTUAL_DEST": "/$http_x_target"}, nil),
+		"VIRTUAL_ROOT variable":      base(map[string]string{"VIRTUAL_ROOT": "/www/$http_host"}, nil),
+		"VIRTUAL_ROOT relative":      base(map[string]string{"VIRTUAL_ROOT": "www"}, nil),
 		"loadbalance directive":      base(nil, map[string]string{labelPrefix + "loadbalance": "least_conn; } server { listen 81;"}),
 		"non-get-redirect directive": base(nil, map[string]string{labelPrefix + "non-get-redirect": "307 https://evil.test"}),
 	}
@@ -255,6 +260,7 @@ func TestContainerValuesAreValidated(t *testing.T) {
 	accepted := base(map[string]string{
 		"HSTS": "max-age=31536000; includeSubDomains; preload", "SERVER_TOKENS": "build",
 		"SSL_POLICY": "Mozilla-Modern", "EXTERNAL_HTTPS_PORT": "8443", "CERT_NAME": "shared",
+		"VIRTUAL_DEST": "/app/", "VIRTUAL_ROOT": "/var/www/public",
 	}, map[string]string{labelPrefix + "loadbalance": "hash $remote_addr consistent;", labelPrefix + "non-get-redirect": "308"})
 	if cfg := Build(defaults(), []*docker.Container{self, accepted}, self, fakeFS{}); len(cfg.VHosts) != 1 {
 		t.Fatal("valid container was rejected")
@@ -437,5 +443,40 @@ func TestHostsWithSlashesAreIgnored(t *testing.T) {
 	cfg := Build(defaults(), []*docker.Container{self, c}, self, fakeFS{})
 	if len(cfg.VHosts) != 1 || cfg.VHosts[0].Host != "ok.test" {
 		t.Fatalf("got %+v", cfg.VHosts)
+	}
+}
+
+func TestUpstreamNamesCannotCollide(t *testing.T) {
+	self := ctr("proxy", nil, nil, map[string]string{"web": "172.20.0.2"})
+	victim := ctr("victim", map[string]string{"VIRTUAL_HOST": "a.test", "VIRTUAL_PATH": "/api"}, nil, map[string]string{"web": "172.20.0.3"})
+	// Sorted before the victim, so nginx would blame the victim for the
+	// duplicate upstream.
+	clash := ctr("0-clash", map[string]string{"VIRTUAL_HOST": "a.test-" + sha1hex("/api") + "," + sha1hex("x.test")}, nil, map[string]string{"web": "172.20.0.4"})
+	upper := ctr("0-upper", map[string]string{"VIRTUAL_HOST": "A.TEST", "VIRTUAL_PATH": "/api"}, nil, map[string]string{"web": "172.20.0.5"})
+	for _, sha := range []bool{false, true} {
+		s := defaults()
+		s.SHA1UpstreamName = sha
+		cfg := Build(s, []*docker.Container{self, clash, upper, victim}, self, fakeFS{})
+		if len(cfg.VHosts) != 1 || len(cfg.Upstreams) != 1 {
+			t.Fatalf("sha1=%v: want one host and one upstream, got %d hosts, %d upstreams", sha, len(cfg.VHosts), len(cfg.Upstreams))
+		}
+		// Hosts that differ only in case are the same host to nginx.
+		if got := cfg.Upstreams[0].Servers; len(got) != 2 {
+			t.Fatalf("sha1=%v: A.TEST and a.test should share an upstream, got %v", sha, got)
+		}
+	}
+}
+
+func TestACMERequestsAreScopedAndMerged(t *testing.T) {
+	self := ctr("proxy", nil, nil, map[string]string{"web": "172.20.0.2"})
+	staging := ctr("0-staging", map[string]string{
+		"VIRTUAL_HOST": "app.test", "LETSENCRYPT_HOST": "App.test,other.test", "LETSENCRYPT_TEST": "true",
+	}, nil, map[string]string{"web": "172.20.0.3"})
+	prod := ctr("app", map[string]string{"VIRTUAL_HOST": "app.test", "LETSENCRYPT_HOST": "app.test"}, nil, map[string]string{"web": "172.20.0.4"})
+	cfg := Build(defaults(), []*docker.Container{self, staging, prod}, self, fakeFS{})
+	// other.test is not served by the container that asks for it, and the
+	// proxy's own CA wins over LETSENCRYPT_TEST for a shared host.
+	if len(cfg.ACME) != 1 || cfg.ACME[0].Domain != "app.test" || cfg.ACME[0].DirectoryURL != LetsEncryptProduction {
+		t.Fatalf("unexpected ACME requests %+v", cfg.ACME)
 	}
 }

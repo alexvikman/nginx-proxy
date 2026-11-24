@@ -134,7 +134,7 @@ func (m *Manager) pass(ctx context.Context) time.Duration {
 		if ctx.Err() != nil {
 			return next
 		}
-		if !m.needsCert(req.Domain) {
+		if !m.needsCert(req) {
 			delete(m.failures, req.Domain)
 			continue
 		}
@@ -171,8 +171,15 @@ func backoff(failures int) time.Duration {
 }
 
 // needsCert reports whether the domain lacks a certificate that covers it
-// and is valid for longer than renewBefore.
-func (m *Manager) needsCert(domain string) bool {
+// and is valid for longer than renewBefore, or has one that this proxy
+// obtained from a different CA than the one now requested (for example a
+// staging certificate once LETSENCRYPT_TEST is removed). Certificates the
+// proxy did not obtain itself are left alone until they need renewal.
+func (m *Manager) needsCert(req proxy.ACMERequest) bool {
+	domain := req.Domain
+	if ca, err := os.ReadFile(m.issuerPath(domain)); err == nil && strings.TrimSpace(string(ca)) != req.DirectoryURL {
+		return true
+	}
 	data, err := os.ReadFile(filepath.Join(m.CertDir, domain+".crt"))
 	if err != nil {
 		return true
@@ -259,7 +266,7 @@ func (m *Manager) obtain(ctx context.Context, req proxy.ACMERequest) error {
 	if err != nil {
 		return fmt.Errorf("finalize order: %w", err)
 	}
-	return m.store(req.Domain, certKey, der)
+	return m.store(req.Domain, req.DirectoryURL, certKey, der)
 }
 
 func (m *Manager) authorize(ctx context.Context, c *acme.Client, url string) error {
@@ -346,7 +353,13 @@ func (m *Manager) selfCheck(ctx context.Context, domain, token, want string) err
 	}
 }
 
-func (m *Manager) store(domain string, key *ecdsa.PrivateKey, der [][]byte) error {
+// issuerPath is where the directory URL of the CA that issued the domain's
+// certificate is recorded.
+func (m *Manager) issuerPath(domain string) string {
+	return filepath.Join(m.CertDir, ".acme", "issuer", domain)
+}
+
+func (m *Manager) store(domain, directoryURL string, key *ecdsa.PrivateKey, der [][]byte) error {
 	if len(der) == 0 {
 		return errors.New("CA returned an empty certificate chain")
 	}
@@ -370,7 +383,13 @@ func (m *Manager) store(domain string, key *ecdsa.PrivateKey, der [][]byte) erro
 	if err := writeFile(base+".chain.pem", chain, 0o644); err != nil {
 		return err
 	}
-	return writeFile(base+".crt", full, 0o644)
+	if err := writeFile(base+".crt", full, 0o644); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(m.issuerPath(domain)), 0o700); err != nil {
+		return err
+	}
+	return writeFile(m.issuerPath(domain), []byte(directoryURL+"\n"), 0o600)
 }
 
 func loadOrCreateKey(path string) (crypto.Signer, error) {

@@ -76,7 +76,7 @@ The differences and missing features are listed under
 | `VIRTUAL_PORT` | single exposed port, else `80` | Port the container listens on. |
 | `VIRTUAL_PROTO` | `http` | `http`, `https`, `grpc`, `grpcs`, `uwsgi` or `fastcgi`. |
 | `VIRTUAL_PATH` | `/` | Route only this path (or nginx location regex) to the container. |
-| `VIRTUAL_DEST` | | Rewrite `VIRTUAL_PATH` to this prefix before proxying. |
+| `VIRTUAL_DEST` | | Rewrite `VIRTUAL_PATH` to this path prefix (starting with `/`) before proxying. |
 | `VIRTUAL_ROOT` | `/var/www/public` | Document root for `fastcgi`. |
 | `HTTPS_METHOD` | proxy value | `redirect`, `noredirect`, `nohttp` or `nohttps`. |
 | `HSTS` | proxy value | `Strict-Transport-Security` value, or `off`. |
@@ -87,9 +87,9 @@ The differences and missing features are listed under
 | `EXTERNAL_HTTPS_PORT` | `HTTPS_PORT` | Port used in HTTP to HTTPS redirects. |
 | `ENABLE_HTTP_ON_MISSING_CERT` | proxy value | Serve HTTP when no certificate exists. |
 | `ACME_HTTP_CHALLENGE_LOCATION` | proxy value | Answer ACME challenges for this host. |
-| `LETSENCRYPT_HOST` | | Comma-separated host names to obtain certificates for. |
+| `LETSENCRYPT_HOST` | | Comma-separated host names to obtain certificates for. Each must also be in the container's `VIRTUAL_HOST`. |
 | `LETSENCRYPT_EMAIL` | `DEFAULT_EMAIL` | ACME account contact. |
-| `LETSENCRYPT_TEST` | `false` | Use the Let's Encrypt staging CA. |
+| `LETSENCRYPT_TEST` | `false` | Use the Let's Encrypt staging CA. When containers sharing a host disagree, `ACME_CA_URI` wins. |
 | label `com.github.nginx-proxy.nginx-proxy.keepalive` | `auto` | Upstream keepalive: `auto` (2 × servers), a number, or `disabled`. |
 | label `com.github.nginx-proxy.nginx-proxy.loadbalance` | | Upstream directive, e.g. `least_conn;`. |
 | label `com.github.nginx-proxy.nginx-proxy.http2.enable` | proxy value | HTTP/2 for this host. |
@@ -100,6 +100,16 @@ Containers whose `VIRTUAL_*` values contain whitespace, `;`, `{`, `}`, quotes,
 `#` or a backslash are ignored with a warning, so a container cannot inject
 nginx directives. Backslashes are allowed in regex hosts and regex paths
 (those starting with `~`), except as the last character.
+
+`VIRTUAL_DEST` and `VIRTUAL_ROOT` must be absolute paths without `$`. Host
+names that look like generated upstream names (40 hex digits, optionally
+after a `-`) are ignored, and host names that differ only in case are one
+host.
+
+Every container that can set `VIRTUAL_HOST` is trusted to serve that host,
+just as with nginx-proxy/nginx-proxy: two containers with the same host are
+load balanced. Use `DOCKER_CONTAINER_FILTERS` to limit which containers the
+proxy considers when not everyone who starts containers is trusted.
 
 A container that uses another container's network namespace
 (`network_mode: service:<name>` or `container:<name>`) is reached through

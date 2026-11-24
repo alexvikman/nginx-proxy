@@ -159,6 +159,7 @@ func Build(s Settings, containers []*docker.Container, self *docker.Container, f
 	}
 	var hosts []*hostGroup
 	byHost := map[string]*hostGroup{}
+	acmeIdx := map[string]int{} // hostKey -> index in cfg.ACME
 
 	for _, ctr := range containers {
 		if self != nil && ctr.ID == self.ID {
@@ -173,11 +174,15 @@ func Build(s Settings, containers []*docker.Container, self *docker.Container, f
 			continue
 		}
 		vhosts := slices.DeleteFunc(splitList(env["VIRTUAL_HOST"]), func(h string) bool {
-			if safeMatcher(h) && !strings.Contains(h, "/") {
-				return false
+			if !safeMatcher(h) || strings.Contains(h, "/") {
+				warn("ignoring unsafe VIRTUAL_HOST entry", "container", ctr.ShortName(), "host", h)
+				return true
 			}
-			warn("ignoring unsafe VIRTUAL_HOST entry", "container", ctr.ShortName(), "host", h)
-			return true
+			if reservedHost(h) {
+				warn("ignoring VIRTUAL_HOST entry that looks like a generated upstream name", "container", ctr.ShortName(), "host", h)
+				return true
+			}
+			return false
 		})
 		if len(vhosts) == 0 {
 			continue
@@ -194,10 +199,14 @@ func Build(s Settings, containers []*docker.Container, self *docker.Container, f
 			path = "/"
 		}
 		for _, h := range vhosts {
-			hg := byHost[h]
+			// nginx compares server and upstream names without regard to
+			// case, so A.test and a.test are one host. The first spelling
+			// seen names it, which keeps vhost.d and cert file names working.
+			key := hostKey(h)
+			hg := byHost[key]
 			if hg == nil {
 				hg = &hostGroup{host: h}
-				byHost[h] = hg
+				byHost[key] = hg
 				hosts = append(hosts, hg)
 			}
 			var pg *pathGroup
@@ -231,7 +240,23 @@ func Build(s Settings, containers []*docker.Container, self *docker.Container, f
 					warn("ignoring invalid LETSENCRYPT_HOST entry", "container", ctr.ShortName(), "host", d)
 					continue
 				}
-				cfg.ACME = append(cfg.ACME, ACMERequest{Domain: d, Email: email, DirectoryURL: dir})
+				// A container only gets certificates for hosts it serves.
+				if !slices.ContainsFunc(vhosts, func(h string) bool { return hostKey(h) == hostKey(d) }) {
+					warn("ignoring LETSENCRYPT_HOST entry that is not in the container's VIRTUAL_HOST", "container", ctr.ShortName(), "host", d)
+					continue
+				}
+				req := ACMERequest{Domain: byHost[hostKey(d)].host, Email: email, DirectoryURL: dir}
+				// When containers disagree on the CA, the proxy's own CA
+				// wins, so a LETSENCRYPT_TEST container cannot put a staging
+				// certificate on a host another container serves.
+				if i, ok := acmeIdx[hostKey(d)]; ok {
+					if cfg.ACME[i].DirectoryURL != s.ACMECAURI && dir == s.ACMECAURI {
+						cfg.ACME[i] = req
+					}
+					continue
+				}
+				acmeIdx[hostKey(d)] = len(cfg.ACME)
+				cfg.ACME = append(cfg.ACME, req)
 			}
 		}
 	}
@@ -246,7 +271,7 @@ func Build(s Settings, containers []*docker.Container, self *docker.Container, f
 		if vh.IsRegex {
 			vh.FileKey = sha1hex(hg.host)
 		}
-		vh.Default = s.DefaultHost != "" && hg.host == s.DefaultHost
+		vh.Default = s.DefaultHost != "" && hostKey(hg.host) == hostKey(s.DefaultHost)
 		vh.SSLPolicy = envOr(first.env, "SSL_POLICY", s.SSLPolicy)
 		vh.ServerTokens = first.env["SERVER_TOKENS"]
 		vh.HTTP2 = labelBool(first.ctr, "http2.enable", s.EnableHTTP2)
@@ -575,6 +600,8 @@ func labelBool(ctr *docker.Container, name string, def bool) bool {
 
 var (
 	domainRe      = regexp.MustCompile(`^(?i)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+	pathRe        = regexp.MustCompile(`^(/[A-Za-z0-9._~%/:@!&=+,-]*)?$`)
+	generatedRe   = regexp.MustCompile(`(?i)(^|-)[0-9a-f]{40}$`)
 	loadBalanceRe = regexp.MustCompile(`^(least_conn|ip_hash|random(\s+two(\s+least_conn)?)?|hash\s+[^\s;{}'"#\\]+(\s+consistent)?)\s*;$`)
 	sslPolicies   = []string{"", "Mozilla-Modern", "Mozilla-Intermediate", "Mozilla-Old"}
 	protos        = []string{"", "http", "https", "uwsgi", "fastcgi", "grpc", "grpcs"}
@@ -590,10 +617,14 @@ func validateContainer(env, labels map[string]string) error {
 	if !safeMatcher(env["VIRTUAL_PATH"]) {
 		return fmt.Errorf("VIRTUAL_PATH contains characters that are not allowed")
 	}
-	for _, k := range []string{"VIRTUAL_DEST", "VIRTUAL_ROOT"} {
-		if !safeToken(env[k]) {
-			return fmt.Errorf("%s contains characters that are not allowed", k)
-		}
+	// VIRTUAL_DEST is appended to the upstream name in proxy_pass: anything
+	// but a path would change the host nginx connects to (".evil.test/").
+	// "$" is refused in both, as nginx expands variables there.
+	if !pathRe.MatchString(env["VIRTUAL_DEST"]) {
+		return fmt.Errorf("VIRTUAL_DEST must be empty or a path starting with \"/\", got %q", env["VIRTUAL_DEST"])
+	}
+	if !pathRe.MatchString(env["VIRTUAL_ROOT"]) {
+		return fmt.Errorf("VIRTUAL_ROOT must be empty or an absolute path, got %q", env["VIRTUAL_ROOT"])
 	}
 	for _, k := range []string{"VIRTUAL_PORT", "EXTERNAL_HTTPS_PORT", "EXTERNAL_HTTP_PORT"} {
 		if v := strings.TrimSpace(env[k]); v != "" {
@@ -643,6 +674,23 @@ func safeMatcher(s string) bool {
 		return safeToken(s)
 	}
 	return !strings.ContainsAny(s, " \t\r\n;{}'\"#") && !strings.HasSuffix(s, `\`)
+}
+
+// hostKey is the name nginx sees for host: server and upstream names are
+// matched without regard to case. Regular expressions are kept as they are.
+func hostKey(h string) string {
+	if strings.HasPrefix(h, "~") {
+		return h
+	}
+	return strings.ToLower(h)
+}
+
+// reservedHost reports whether h has the shape of a generated upstream name
+// (a SHA-1, or a host followed by "-" and the SHA-1 of a path). Such a host
+// would get the same upstream name as another host and path, and the
+// duplicate upstream would make nginx reject the whole configuration.
+func reservedHost(h string) bool {
+	return !strings.HasPrefix(h, "~") && generatedRe.MatchString(h)
 }
 
 func sha1hex(s string) string {
