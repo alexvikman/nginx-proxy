@@ -19,10 +19,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -40,6 +42,10 @@ const (
 	maxBackoff    = 24 * time.Hour
 	orderTimeout  = 3 * time.Minute
 )
+
+// tokenRe is the base64url alphabet that RFC 8555 section 8.3 limits
+// challenge tokens to.
+var tokenRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // Manager keeps certificates for the wanted domains valid.
 type Manager struct {
@@ -240,7 +246,7 @@ func (m *Manager) obtain(ctx context.Context, req proxy.ACMERequest) error {
 		return fmt.Errorf("create order: %w", err)
 	}
 	for _, u := range order.AuthzURLs {
-		if err := m.authorize(ctx, c, u); err != nil {
+		if err := m.authorize(ctx, c, u, req.Domain); err != nil {
 			return err
 		}
 	}
@@ -269,10 +275,16 @@ func (m *Manager) obtain(ctx context.Context, req proxy.ACMERequest) error {
 	return m.store(req.Domain, req.DirectoryURL, certKey, der)
 }
 
-func (m *Manager) authorize(ctx context.Context, c *acme.Client, url string) error {
+// authorize answers the http-01 challenge of one authorization of the order
+// for domain. What the CA sends is not trusted beyond what the protocol
+// allows: it decides a file name here.
+func (m *Manager) authorize(ctx context.Context, c *acme.Client, url, domain string) error {
 	z, err := c.GetAuthorization(ctx, url)
 	if err != nil {
 		return fmt.Errorf("get authorization: %w", err)
+	}
+	if !strings.EqualFold(z.Identifier.Value, domain) {
+		return fmt.Errorf("CA asked to authorize %q in an order for %s", z.Identifier.Value, domain)
 	}
 	if z.Status == acme.StatusValid {
 		return nil
@@ -284,7 +296,13 @@ func (m *Manager) authorize(ctx context.Context, c *acme.Client, url string) err
 		}
 	}
 	if chal == nil {
-		return fmt.Errorf("CA offered no http-01 challenge for %s", z.Identifier.Value)
+		return fmt.Errorf("CA offered no http-01 challenge for %s", domain)
+	}
+	// The token becomes a file name, and the start of that file's content.
+	// With a path separator in it, the CA could write outside ChallengeDir,
+	// for instance into the directories nginx reads its configuration from.
+	if !tokenRe.MatchString(chal.Token) {
+		return fmt.Errorf("CA sent an invalid http-01 token for %s", domain)
 	}
 	body, err := c.HTTP01ChallengeResponse(chal.Token)
 	if err != nil {
@@ -294,19 +312,19 @@ func (m *Manager) authorize(ctx context.Context, c *acme.Client, url string) err
 	if err := os.MkdirAll(m.ChallengeDir, 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+	if err := writeFile(path, []byte(body), 0o644); err != nil {
 		return err
 	}
 	defer os.Remove(path)
 
-	if err := m.selfCheck(ctx, z.Identifier.Value, chal.Token, body); err != nil {
+	if err := m.selfCheck(ctx, domain, chal.Token, body); err != nil {
 		return err
 	}
 	if _, err := c.Accept(ctx, chal); err != nil {
 		return fmt.Errorf("accept challenge: %w", err)
 	}
 	if _, err := c.WaitAuthorization(ctx, z.URI); err != nil {
-		return fmt.Errorf("authorization for %s: %w", z.Identifier.Value, err)
+		return fmt.Errorf("authorization for %s: %w", domain, err)
 	}
 	return nil
 }
@@ -363,6 +381,19 @@ func (m *Manager) store(domain, directoryURL string, key *ecdsa.PrivateKey, der 
 	if len(der) == 0 {
 		return errors.New("CA returned an empty certificate chain")
 	}
+	// Check the certificate before it replaces the one in use: nginx would
+	// refuse a certificate that does not belong to the key, and the host
+	// would be left out until the next attempt.
+	leaf, err := x509.ParseCertificate(der[0])
+	if err != nil {
+		return fmt.Errorf("CA returned an unreadable certificate: %w", err)
+	}
+	if err := leaf.VerifyHostname(domain); err != nil {
+		return fmt.Errorf("CA returned a certificate for another name: %w", err)
+	}
+	if pub, ok := leaf.PublicKey.(*ecdsa.PublicKey); !ok || !pub.Equal(&key.PublicKey) {
+		return errors.New("CA returned a certificate for another key")
+	}
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		return err
@@ -393,12 +424,18 @@ func (m *Manager) store(domain, directoryURL string, key *ecdsa.PrivateKey, der 
 }
 
 func loadOrCreateKey(path string) (crypto.Signer, error) {
-	if data, err := os.ReadFile(path); err == nil {
+	data, err := os.ReadFile(path)
+	if err == nil {
 		block, _ := pem.Decode(data)
 		if block == nil {
 			return nil, fmt.Errorf("%s: no PEM data", path)
 		}
 		return x509.ParseECPrivateKey(block.Bytes)
+	}
+	// Only a missing key is replaced: after any other error (permissions,
+	// I/O) a new key would silently abandon the existing ACME account.
+	if !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
 	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -414,9 +451,26 @@ func loadOrCreateKey(path string) (crypto.Signer, error) {
 	return key, writeFile(path, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), 0o600)
 }
 
+// writeFile replaces path atomically. The temporary file gets a random name
+// and is created exclusively, so nothing planted in a shared certificate
+// volume (a symbolic link in particular) is written through, and it is
+// private until the content is complete: perm is applied last.
 func writeFile(path string, data []byte, perm os.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, perm); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp) // fails harmlessly after the rename
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)

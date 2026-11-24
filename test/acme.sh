@@ -33,6 +33,10 @@ trap cleanup EXIT
 
 docker network create "$NET" >/dev/null
 mkdir -p "$WORK/certs"
+# The proxy runs without CAP_DAC_OVERRIDE (see below), so root in the
+# container can only write to a directory of another user if everyone can.
+# A named volume, as in docker-compose.yml, belongs to root and needs nothing.
+chmod 777 "$WORK/certs"
 cat >"$WORK/pebble.json" <<'JSON'
 {
   "pebble": {
@@ -54,7 +58,10 @@ docker run -d --label "$RUN_ID" --name "$RUN_ID-pebble" --network "$NET" --netwo
 	"$PEBBLE_IMAGE" -config /test/config/pebble-config.json >/dev/null
 docker cp "$RUN_ID-pebble:/test/certs/pebble.minica.pem" "$WORK/pebble-ca.pem" >/dev/null
 
+# With the reduced privileges the README recommends, as in integration.sh.
 docker run -d --label "$RUN_ID" --name "$RUN_ID-proxy" --network "$NET" --network-alias "$DOMAIN" \
+	--cap-drop ALL --cap-add CHOWN --cap-add SETGID --cap-add SETUID --cap-add NET_BIND_SERVICE \
+	--security-opt no-new-privileges \
 	-v /var/run/docker.sock:/tmp/docker.sock:ro \
 	-v "$WORK/certs:/etc/nginx/certs" \
 	-v "$WORK/pebble-ca.pem:/etc/pebble-ca.pem:ro" \

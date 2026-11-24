@@ -25,6 +25,10 @@ import (
 const (
 	debounce       = 250 * time.Millisecond
 	resyncInterval = 30 * time.Second
+
+	// workerUser is the "user" of rootfs/etc/nginx/nginx.conf: the nginx
+	// workers, which handle the traffic, run as this user.
+	workerUser = "nginx"
 )
 
 func main() {
@@ -55,6 +59,12 @@ func run() error {
 		dockerHost = "unix:///var/run/docker.sock"
 	}
 	filters := docker.ParseFilters(env["DOCKER_CONTAINER_FILTERS"])
+	if socket, ok := strings.CutPrefix(dockerHost, "unix://"); ok {
+		if open, known := docker.SocketOpenTo(socket, workerUser); known && open {
+			slog.Warn("the nginx workers can open the Docker socket, so a compromised worker would control the Docker host; "+
+				"restrict the socket to root or put a filtering socket proxy in front", "socket", socket, "user", workerUser)
+		}
+	}
 
 	cli, err := docker.New(dockerHost)
 	if err != nil {

@@ -67,7 +67,11 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 
 	-keyout "$WORK/certs/tls.test.key" -out "$WORK/certs/tls.test.crt" 2>/dev/null
 chmod 644 "$WORK/certs/"*
 
+# The proxy runs with the reduced privileges the README recommends, so that
+# setup is the one that is tested.
 docker run -d --label "$RUN_ID" --name "$RUN_ID-proxy" --network "$NET" \
+	--cap-drop ALL --cap-add CHOWN --cap-add SETGID --cap-add SETUID --cap-add NET_BIND_SERVICE \
+	--security-opt no-new-privileges \
 	-v /var/run/docker.sock:/tmp/docker.sock:ro \
 	-v "$WORK/certs:/etc/nginx/certs" \
 	-v "$WORK/vhost.d:/etc/nginx/vhost.d" \
@@ -82,6 +86,11 @@ backend a -e VIRTUAL_HOST=a.test -e VIRTUAL_PORT=8080
 backend b -e VIRTUAL_HOST=b.test -e VIRTUAL_PORT=8080 -e VIRTUAL_PATH=/b/ -e VIRTUAL_DEST=/
 backend tls -e VIRTUAL_HOST=tls.test -e VIRTUAL_PORT=8080
 backend evil -e "VIRTUAL_HOST=evil.test;" -e VIRTUAL_PORT=8080
+# nginx expands variables in proxy_pass: as a host name this would let the
+# client choose where the proxy connects to.
+# shellcheck disable=SC2016
+backend ssrf -e 'VIRTUAL_HOST=$http_x_target' -e VIRTUAL_PORT=8080
+A_IP="$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}" "$RUN_ID-a")"
 
 check "routes by Host header" "body:hello-a" -H "Host: a.test" "http://$HTTP/"
 check "unknown host gets 503" 503 -H "Host: nope.test" "http://$HTTP/"
@@ -92,6 +101,8 @@ check "HTTPS with certificate" "body:hello-tls" -k --resolve "tls.test:443:$PROX
 check "HTTPS without certificate is rejected" 000 -k --resolve "a.test:443:$PROXY_IP" "https://a.test/"
 check "ACME challenge path is served on redirecting hosts" 404 -H "Host: tls.test" "http://$HTTP/.well-known/acme-challenge/missing"
 check "unsafe VIRTUAL_HOST is ignored" 503 -H "Host: evil.test;" "http://$HTTP/"
+# shellcheck disable=SC2016
+check "a variable as VIRTUAL_HOST is ignored" 503 -H 'Host: $http_x_target' -H "X-Target: $A_IP:8080" "http://$HTTP/"
 
 # Load balancing across two containers with the same VIRTUAL_HOST.
 backend lb1 -e VIRTUAL_HOST=lb.test -e VIRTUAL_PORT=8080

@@ -246,6 +246,7 @@ func TestContainerValuesAreValidated(t *testing.T) {
 		"VIRTUAL_DEST variable":      base(map[string]string{"VIRTUAL_DEST": "/$http_x_target"}, nil),
 		"VIRTUAL_ROOT variable":      base(map[string]string{"VIRTUAL_ROOT": "/www/$http_host"}, nil),
 		"VIRTUAL_ROOT relative":      base(map[string]string{"VIRTUAL_ROOT": "www"}, nil),
+		"CERT_NAME variable":         base(map[string]string{"CERT_NAME": "$ssl_server_name"}, nil),
 		"loadbalance directive":      base(nil, map[string]string{labelPrefix + "loadbalance": "least_conn; } server { listen 81;"}),
 		"non-get-redirect directive": base(nil, map[string]string{labelPrefix + "non-get-redirect": "307 https://evil.test"}),
 	}
@@ -478,5 +479,163 @@ func TestACMERequestsAreScopedAndMerged(t *testing.T) {
 	// proxy's own CA wins over LETSENCRYPT_TEST for a shared host.
 	if len(cfg.ACME) != 1 || cfg.ACME[0].Domain != "app.test" || cfg.ACME[0].DirectoryURL != LetsEncryptProduction {
 		t.Fatalf("unexpected ACME requests %+v", cfg.ACME)
+	}
+}
+
+func TestPlainHostsAreHostNames(t *testing.T) {
+	self := ctr("proxy", nil, nil, map[string]string{"web": "172.20.0.2"})
+	hosts := func(virtualHost string) []string {
+		c := ctr("app", map[string]string{"VIRTUAL_HOST": virtualHost}, nil, map[string]string{"web": "172.20.0.3"})
+		var got []string
+		for _, vh := range Build(defaults(), []*docker.Container{self, c}, self, fakeFS{}).VHosts {
+			got = append(got, vh.Host)
+		}
+		return got
+	}
+	// nginx expands variables in proxy_pass: as a host, and so as the name
+	// of the upstream, "$http_x_t" would let a client pick the destination.
+	for _, bad := range []string{"$http_x_t", "a.test$arg_u", "a?c.test", "[ab].test", "a.test:80", "a=b", "@named", ".", "..", "a(b).test", "a|b"} {
+		if got := hosts(bad); len(got) != 0 {
+			t.Errorf("VIRTUAL_HOST=%q was accepted as %v", bad, got)
+		}
+	}
+	good := []string{"app.test", "*.wild.test", "www.wild.*", ".dot.test", "under_score.test", "UPPER.test", "10.0.0.1", "_"}
+	if got := hosts(strings.Join(good, ",")); !slices.Equal(got, good) {
+		t.Errorf("hosts = %v, want %v", got, good)
+	}
+}
+
+func TestNamedCapturesAreRefused(t *testing.T) {
+	self := ctr("proxy", nil, nil, map[string]string{"web": "172.20.0.2"})
+	build := func(env map[string]string) *Config {
+		c := ctr("app", env, nil, map[string]string{"web": "172.20.0.3"})
+		return Build(defaults(), []*docker.Container{self, c}, self, fakeFS{})
+	}
+	// A named group defines an nginx variable for every host.
+	for _, host := range []string{`~^(?<acl_ok>a)\.evil\.test$`, `~^(?P<proxy_x_forwarded_proto>https)\.evil\.test$`} {
+		if cfg := build(map[string]string{"VIRTUAL_HOST": host}); len(cfg.VHosts) != 0 {
+			t.Errorf("VIRTUAL_HOST=%q was accepted", host)
+		}
+	}
+	if cfg := build(map[string]string{"VIRTUAL_HOST": "app.test", "VIRTUAL_PATH": `~^/(?<http_upgrade>x)`}); len(cfg.VHosts) != 0 {
+		t.Error("a named capture in VIRTUAL_PATH was accepted")
+	}
+	// Plain groups and lookbehinds define nothing.
+	cfg := build(map[string]string{"VIRTUAL_HOST": `~^(www|app)\.re\.test$`, "VIRTUAL_PATH": `~^/(?<!x)(?<=/)(api|v1)/`})
+	if len(cfg.VHosts) != 1 || len(cfg.VHosts[0].Locations) != 1 {
+		t.Fatalf("a regex without named captures was rejected: %+v", cfg.VHosts)
+	}
+}
+
+func TestNetworkAccessFailsClosed(t *testing.T) {
+	self := ctr("proxy", nil, nil, map[string]string{"web": "172.20.0.2"})
+	internal := func(values ...string) bool {
+		containers := []*docker.Container{self}
+		for i, v := range values {
+			env := map[string]string{"VIRTUAL_HOST": "app.test"}
+			if v != "" {
+				env["NETWORK_ACCESS"] = v
+			}
+			containers = append(containers, ctr("app-"+string(rune('a'+i)), env, nil, map[string]string{"web": "172.20.0.3"}))
+		}
+		return Build(defaults(), containers, self, fakeFS{}).VHosts[0].Locations[0].Internal
+	}
+	for _, v := range []string{"internal", "Internal", " internal ", "INTERNAL", "intenal", "private"} {
+		if !internal(v) {
+			t.Errorf("NETWORK_ACCESS=%q must restrict the location", v)
+		}
+	}
+	for _, v := range []string{"", "external", "External"} {
+		if internal(v) {
+			t.Errorf("NETWORK_ACCESS=%q must not restrict the location", v)
+		}
+	}
+	// The first container alone must not decide: one asking is enough.
+	if !internal("", "internal") || !internal("internal", "") {
+		t.Error("a location is internal as soon as one of its containers asks for it")
+	}
+}
+
+func TestHostFilesIgnoreCase(t *testing.T) {
+	self := ctr("proxy", nil, nil, map[string]string{"web": "172.20.0.2"})
+	// The operator protects app.test; the container announces App.Test,
+	// which is the same host to nginx.
+	fs := fakeFS{
+		HtpasswdDir + "/app.test":       true,
+		VhostDir + "/app.test":          true,
+		VhostDir + "/app.test_location": true,
+		CertDir + "/app.test.crt":       true, CertDir + "/app.test.key": true,
+	}
+	c := ctr("app", map[string]string{"VIRTUAL_HOST": "App.Test"}, nil, map[string]string{"web": "172.20.0.3"})
+	vh := Build(defaults(), []*docker.Container{self, c}, self, fs).VHosts[0]
+	loc := vh.Locations[0]
+	if loc.AuthFile != HtpasswdDir+"/app.test" {
+		t.Errorf("basic auth was dropped: AuthFile = %q", loc.AuthFile)
+	}
+	if vh.Include != VhostDir+"/app.test" || loc.Include != VhostDir+"/app.test_location" {
+		t.Errorf("includes were dropped: %q, %q", vh.Include, loc.Include)
+	}
+	if vh.Cert != "app.test" {
+		t.Errorf("certificate was not found: %q", vh.Cert)
+	}
+
+	// The spelling the container used wins when both exist.
+	fs[HtpasswdDir+"/App.Test"] = true
+	vh = Build(defaults(), []*docker.Container{self, c}, self, fs).VHosts[0]
+	if got := vh.Locations[0].AuthFile; got != HtpasswdDir+"/App.Test" {
+		t.Errorf("AuthFile = %q", got)
+	}
+}
+
+func TestAuthRealmHasNoRegex(t *testing.T) {
+	self := ctr("proxy", nil, nil, map[string]string{"web": "172.20.0.2"})
+	path := `~^/admin/\d+$`
+	fs := fakeFS{HtpasswdDir + "/app.test_" + sha1hex(path): true, HtpasswdDir + "/plain.test": true}
+	re := ctr("app", map[string]string{"VIRTUAL_HOST": "app.test", "VIRTUAL_PATH": path}, nil, map[string]string{"web": "172.20.0.3"})
+	plain := ctr("plain", map[string]string{"VIRTUAL_HOST": "plain.test"}, nil, map[string]string{"web": "172.20.0.4"})
+	out := render(t, Build(defaults(), []*docker.Container{self, re, plain}, self, fs))
+	// nginx expands variables in the realm; "$" before the closing quote is
+	// an error that would take the host down.
+	for _, want := range []string{`auth_basic "Restricted access";`, `auth_basic "Restricted plain.test";`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered config is missing %q", want)
+		}
+	}
+}
+
+func TestHTTPoxyIsMitigatedForCGIProtocols(t *testing.T) {
+	self := ctr("proxy", nil, nil, map[string]string{"web": "172.20.0.2"})
+	for proto, want := range map[string]string{"fastcgi": `fastcgi_param HTTP_PROXY "";`, "uwsgi": `uwsgi_param HTTP_PROXY "";`, "http": `proxy_set_header Proxy "";`} {
+		c := ctr("app", map[string]string{"VIRTUAL_HOST": "app.test", "VIRTUAL_PROTO": proto}, nil, map[string]string{"web": "172.20.0.3"})
+		if out := render(t, Build(defaults(), []*docker.Container{self, c}, self, fakeFS{})); !strings.Contains(out, want) {
+			t.Errorf("VIRTUAL_PROTO=%s: rendered config is missing %q", proto, want)
+		}
+	}
+}
+
+func TestForwardedForFollowsDownstreamTrust(t *testing.T) {
+	for trust, want := range map[bool]string{
+		true:  "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+		false: "proxy_set_header X-Forwarded-For $remote_addr;",
+	} {
+		s := defaults()
+		s.TrustDownstreamProxy = trust
+		out := render(t, Build(s, nil, nil, fakeFS{}))
+		if !strings.Contains(out, want) || strings.Count(out, "proxy_set_header X-Forwarded-For") != 1 {
+			t.Errorf("TRUST_DOWNSTREAM_PROXY=%v: want exactly %q", trust, want)
+		}
+	}
+}
+
+func TestNumbersAreNormalized(t *testing.T) {
+	self := ctr("proxy", nil, nil, map[string]string{"web": "172.20.0.2"})
+	fs := fakeFS{CertDir + "/app.test.crt": true, CertDir + "/app.test.key": true}
+	c := ctr("app", map[string]string{"VIRTUAL_HOST": "app.test", "EXTERNAL_HTTPS_PORT": "+8443", "CERT_NAME": ""},
+		map[string]string{labelPrefix + "keepalive": "+8"}, map[string]string{"web": "172.20.0.3"})
+	out := render(t, Build(defaults(), []*docker.Container{self, c}, self, fs))
+	for _, want := range []string{"return 301 https://$host:8443$request_uri;", "keepalive 8;"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered config is missing %q", want)
+		}
 	}
 }

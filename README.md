@@ -35,6 +35,7 @@ services:
       - "443:443"
     environment:
       DEFAULT_EMAIL: ops@example.com
+      TRUST_DOWNSTREAM_PROXY: "false" # no other proxy in front of this one
     volumes:
       - /var/run/docker.sock:/tmp/docker.sock:ro
       - certs:/etc/nginx/certs
@@ -52,6 +53,9 @@ volumes:
 
 The proxy can only reach containers that share a Docker network with it. In
 the example above, Compose puts both services on the same default network.
+
+[`docker-compose.yml`](docker-compose.yml) is the same setup with reduced
+container privileges. See [Security](#security) before exposing the proxy.
 
 ## Moving from nginx-proxy/nginx-proxy
 
@@ -72,7 +76,7 @@ The differences and missing features are listed under
 
 | Variable / label | Default | Description |
 |---|---|---|
-| `VIRTUAL_HOST` | | Comma-separated host names. Wildcards (`*.example.com`) and regexes (`~^app\..*`) work. |
+| `VIRTUAL_HOST` | | Comma-separated host names. Wildcards (`*.example.com`) and regexes (`~^app\..*`) work. Named captures do not. |
 | `VIRTUAL_PORT` | single exposed port, else `80` | Port the container listens on. |
 | `VIRTUAL_PROTO` | `http` | `http`, `https`, `grpc`, `grpcs`, `uwsgi` or `fastcgi`. |
 | `VIRTUAL_PATH` | `/` | Route only this path (or nginx location regex) to the container. |
@@ -82,7 +86,7 @@ The differences and missing features are listed under
 | `HSTS` | proxy value | `Strict-Transport-Security` value, or `off`. |
 | `SSL_POLICY` | proxy value | `Mozilla-Intermediate`, `Mozilla-Modern` or `Mozilla-Old`. |
 | `CERT_NAME` | | Use `/etc/nginx/certs/<CERT_NAME>.crt` instead of the per-host lookup. |
-| `NETWORK_ACCESS` | `external` | `internal` only allows clients from `network_internal.conf`. |
+| `NETWORK_ACCESS` | `external` | `internal` only allows clients from `network_internal.conf`. Any other value than `external` is treated as `internal`. |
 | `SERVER_TOKENS` | | `server_tokens` for this host. |
 | `EXTERNAL_HTTPS_PORT` | `HTTPS_PORT` | Port used in HTTP to HTTPS redirects. |
 | `ENABLE_HTTP_ON_MISSING_CERT` | proxy value | Serve HTTP when no certificate exists. |
@@ -96,13 +100,23 @@ The differences and missing features are listed under
 | label `com.github.nginx-proxy.nginx-proxy.non-get-redirect` | proxy value | `307` or `308` for non-GET HTTPS redirects. |
 | label `com.github.nginx-proxy.nginx-proxy.trust-default-cert` | proxy value | Fall back to `default.crt`. |
 
-Containers whose `VIRTUAL_*` values contain whitespace, `;`, `{`, `}`, quotes,
-`#` or a backslash are ignored with a warning, so a container cannot inject
-nginx directives. Backslashes are allowed in regex hosts and regex paths
-(those starting with `~`), except as the last character.
+Containers are not trusted to write nginx configuration. A value that could
+change its structure is refused with a warning: an unsafe `VIRTUAL_HOST`
+entry is skipped, and any other unsafe value makes the proxy ignore the
+container.
 
-`VIRTUAL_DEST` and `VIRTUAL_ROOT` must be absolute paths without `$`. Host
-names that look like generated upstream names (40 hex digits, optionally
+- Plain and wildcard host names consist of letters, digits, `.`, `-`, `_`
+  and `*`. Write internationalized names in Punycode.
+- Regex hosts and regex paths (those starting with `~`) must not contain
+  whitespace, `;`, `{`, `}`, quotes or `#`, and must not end in a backslash.
+  Named captures (`(?<name>...)`) are refused, because a named capture
+  defines an nginx variable for every host, replacing any other variable of
+  that name.
+- Other `VIRTUAL_*` values must not contain whitespace, `;`, `{`, `}`,
+  quotes, `#` or a backslash. `VIRTUAL_DEST` and `VIRTUAL_ROOT` must be
+  absolute paths without `$`.
+
+Host names that look like generated upstream names (40 hex digits, optionally
 after a `-`) are ignored, and host names that differ only in case are one
 host.
 
@@ -130,7 +144,7 @@ that container, which must be visible to the proxy.
 | `ENABLE_HTTP2` | `true` | |
 | `ENABLE_IPV6` | `false` | Also listen on `[::]`. |
 | `PREFER_IPV6_NETWORK` | `false` | Reach containers over IPv6 when they have an address. |
-| `TRUST_DOWNSTREAM_PROXY` | `true` | Forward client-supplied `X-Forwarded-*` headers. Set to `false` unless another proxy sits in front. |
+| `TRUST_DOWNSTREAM_PROXY` | `true` | Forward client-supplied `X-Forwarded-*` headers. Set to `false` unless another proxy sits in front: the headers, `X-Forwarded-For` included, are then set from the connection alone. |
 | `TRUST_DEFAULT_CERT` | `true` | Use `default.crt` for hosts without their own certificate. |
 | `ENABLE_HTTP_ON_MISSING_CERT` | `true` | |
 | `NON_GET_REDIRECT` | `301` | |
@@ -160,9 +174,11 @@ that container, which must be visible to the proxy.
 | `/etc/nginx/network_internal.conf` | Allow list for `NETWORK_ACCESS=internal`. |
 | `/usr/share/nginx/html/errors/50x.html` | Custom error page. |
 
-For regex hosts, `<host>` is the SHA-1 of the regex. Changes to any of these
-files are picked up within 30 seconds, and certificate renewals within
-seconds.
+For regex hosts, `<host>` is the SHA-1 of the regex. Other hosts are looked
+up as the container wrote them and then in lower case, so the files for
+`app.example.com` also apply to a container that announces
+`App.Example.com`. Changes to any of these files are picked up within 30
+seconds, and certificate renewals within seconds.
 
 ## TLS and ACME
 
@@ -183,6 +199,52 @@ certificates and the ACME account key survive container restarts. Wildcard
 certificates need DNS-01, which is not supported. Provide them as files
 instead.
 
+## Security
+
+**Trust.** The proxy's environment and the files mounted into it are trusted.
+A container the proxy sees is trusted to serve the hosts it announces, and to
+get certificates for them, but not to write nginx configuration. If not
+everyone who can start containers should be able to claim a host name, limit
+what the proxy considers with `DOCKER_CONTAINER_FILTERS`.
+
+**Docker socket.** The proxy only reads from the Docker API: `GET /_ping`,
+`/containers/json`, `/containers/<id>/json` and `/events`. Mounting the socket
+with `:ro` does not limit the API, and access to it amounts to root on the
+host. The proxy process and the nginx master run as root. The nginx workers,
+which handle the traffic, run as the `nginx` user and must not be able to
+open the socket: the proxy logs a warning at startup when they can, which is
+the case for a world-writable socket or a socket group with the id of the
+image's `nginx` group. To limit what a compromised proxy could do, put a
+filtering socket proxy in front that only allows those four requests, and
+point `DOCKER_HOST` (`tcp://host:port`) at it over a network that only the
+two share: the connection is not encrypted.
+
+**Container privileges.** The proxy needs four capabilities: to bind ports
+80 and 443, and to start the nginx workers as an unprivileged user.
+
+```yaml
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID, NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+```
+
+The end-to-end tests run the proxy this way. Without `DAC_OVERRIDE`, root in
+the container can only write certificates to a directory it owns. That is the
+case for a named volume. A bind-mounted directory of another user needs a
+`chown` to root, or `DAC_OVERRIDE` added.
+
+**Forwarded headers.** With the default `TRUST_DOWNSTREAM_PROXY=true`, the
+`X-Forwarded-Proto`, `-Host`, `-Port` and `-For` values a client sends reach
+your application, which may use them for redirects, links or the client
+address. Keep the default only when a load balancer or CDN in front of the
+proxy sets these headers.
+
+**`NETWORK_ACCESS=internal`** compares the address nginx sees with
+`network_internal.conf`. Where Docker does not preserve the client address
+(Docker Desktop, rootless Docker, a load balancer in front), every client
+arrives from a private address and is let in. Check the access log for real
+client addresses before relying on it.
+
 ## Not supported yet
 
 - `VIRTUAL_HOST_MULTIPORTS` (a warning is logged and `VIRTUAL_HOST` is used)
@@ -195,7 +257,10 @@ instead.
 
 Differences from upstream: `server_tokens` defaults to `off`, and no DH
 parameters are generated at startup. Provide `dhparam.pem` if you need DHE
-ciphers. ECDHE is used otherwise.
+ciphers. ECDHE is used otherwise. Container values are validated more
+strictly (see [Proxied containers](#proxied-containers)), an unknown
+`NETWORK_ACCESS` value restricts instead of being ignored, and
+`TRUST_DOWNSTREAM_PROXY=false` also replaces `X-Forwarded-For`.
 
 ## Releases and updates
 

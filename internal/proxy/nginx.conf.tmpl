@@ -81,7 +81,12 @@ proxy_set_header Host $http_host;
 proxy_set_header Upgrade $http_upgrade;
 proxy_set_header Connection $proxy_connection;
 proxy_set_header X-Real-IP $remote_addr;
+{{- if .TrustDownstreamProxy }}
 proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+{{- else }}
+# No trusted proxy in front: a client-supplied X-Forwarded-For is replaced, not extended.
+proxy_set_header X-Forwarded-For $remote_addr;
+{{- end }}
 proxy_set_header X-Forwarded-Host $proxy_x_forwarded_host;
 proxy_set_header X-Forwarded-Proto $proxy_x_forwarded_proto;
 proxy_set_header X-Forwarded-Ssl $proxy_x_forwarded_ssl;
@@ -153,9 +158,13 @@ proxy_set_header Proxy "";
         {{- end }}
         {{- if eq $loc.Proto "uwsgi" }}
         include uwsgi_params;
+        # Mitigate httpoxy: never pass a client's Proxy header on as HTTP_PROXY.
+        uwsgi_param HTTP_PROXY "";
         uwsgi_pass uwsgi://{{ $loc.Upstream }};
         {{- else if eq $loc.Proto "fastcgi" }}
         include fastcgi_params;
+        # Mitigate httpoxy: never pass a client's Proxy header on as HTTP_PROXY.
+        fastcgi_param HTTP_PROXY "";
         root {{ $loc.Root }};
         fastcgi_pass {{ $loc.Upstream }};
         {{- if $loc.Keepalive }}

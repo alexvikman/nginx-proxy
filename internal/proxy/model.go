@@ -76,7 +76,6 @@ type Upstream struct {
 // VHost is one server_name with its locations.
 type VHost struct {
 	Host              string
-	FileKey           string // host, or sha1 of the host for regex hosts
 	IsRegex           bool
 	Default           bool
 	ServeHTTP         bool
@@ -95,6 +94,34 @@ type VHost struct {
 	Include           string // server-level include file, "" when none
 	Locations         []*Location
 	DefaultRoot       string // return value for "location /" when no container serves "/"
+
+	fileKeys []string // names the host's files are looked up under, see fileKeys
+}
+
+// hostFile returns the first dir/<key><suffix> that exists, or "".
+func (vh *VHost) hostFile(fs FS, dir, suffix string) string {
+	for _, k := range vh.fileKeys {
+		if p := dir + "/" + k + suffix; fs.Exists(p) {
+			return p
+		}
+	}
+	return ""
+}
+
+// fileKeys returns the names under which the files of a host are looked up
+// in vhost.d, htpasswd and certs: the SHA-1 of a regex host, else the host as
+// the container wrote it and then in lower case. nginx matches server names
+// without regard to case, so basic auth or an include set up for app.test
+// must not be skipped because a container announces App.Test.
+func fileKeys(host string) []string {
+	if strings.HasPrefix(host, "~") {
+		return []string{sha1hex(host)}
+	}
+	keys := []string{host}
+	if l := strings.ToLower(host); l != host {
+		keys = append(keys, l)
+	}
+	return keys
 }
 
 // Location is one location{} block inside a vhost.
@@ -174,7 +201,7 @@ func Build(s Settings, containers []*docker.Container, self *docker.Container, f
 			continue
 		}
 		vhosts := slices.DeleteFunc(splitList(env["VIRTUAL_HOST"]), func(h string) bool {
-			if !safeMatcher(h) || strings.Contains(h, "/") {
+			if !safeHost(h) {
 				warn("ignoring unsafe VIRTUAL_HOST entry", "container", ctr.ShortName(), "host", h)
 				return true
 			}
@@ -264,19 +291,21 @@ func Build(s Settings, containers []*docker.Container, self *docker.Container, f
 	for _, hg := range hosts {
 		first := hg.paths[0].backends[0]
 		vh := &VHost{
-			Host:    hg.host,
-			IsRegex: strings.HasPrefix(hg.host, "~"),
-		}
-		vh.FileKey = hg.host
-		if vh.IsRegex {
-			vh.FileKey = sha1hex(hg.host)
+			Host:     hg.host,
+			IsRegex:  strings.HasPrefix(hg.host, "~"),
+			fileKeys: fileKeys(hg.host),
 		}
 		vh.Default = s.DefaultHost != "" && hostKey(hg.host) == hostKey(s.DefaultHost)
 		vh.SSLPolicy = envOr(first.env, "SSL_POLICY", s.SSLPolicy)
-		vh.ServerTokens = first.env["SERVER_TOKENS"]
+		vh.ServerTokens = strings.TrimSpace(first.env["SERVER_TOKENS"])
 		vh.HTTP2 = labelBool(first.ctr, "http2.enable", s.EnableHTTP2)
 		vh.NonGetRedirect = labelOr(first.ctr, "non-get-redirect", s.NonGetRedirect)
-		vh.ExternalHTTPSPort = envOr(first.env, "EXTERNAL_HTTPS_PORT", s.HTTPSPort)
+		// As for VIRTUAL_PORT, render the parsed number: "+8443" is a valid
+		// integer but not a valid port in a redirect URL.
+		vh.ExternalHTTPSPort = s.HTTPSPort
+		if n, err := strconv.Atoi(strings.TrimSpace(first.env["EXTERNAL_HTTPS_PORT"])); err == nil {
+			vh.ExternalHTTPSPort = strconv.Itoa(n)
+		}
 		vh.ACMEChallenge = envOr(first.env, "ACME_HTTP_CHALLENGE_LOCATION", strconv.FormatBool(s.ACMEChallenge)) != "false"
 
 		// Certificate selection, in the same order as upstream nginx-proxy.
@@ -305,7 +334,7 @@ func Build(s Settings, containers []*docker.Container, self *docker.Container, f
 			vh.HSTS = hsts
 		}
 
-		if p := VhostDir + "/" + vh.FileKey; fs.Exists(p) {
+		if p := vh.hostFile(fs, VhostDir, ""); p != "" {
 			vh.Include = p
 		} else if fs.Exists(VhostDir + "/default") {
 			vh.Include = VhostDir + "/default"
@@ -318,7 +347,7 @@ func Build(s Settings, containers []*docker.Container, self *docker.Container, f
 			}
 			up := buildUpstream(s, hg.host, pg.path, pg.backends)
 			cfg.Upstreams = append(cfg.Upstreams, up)
-			vh.Locations = append(vh.Locations, buildLocation(fs, vh, pg.path, up, pg.backends[0]))
+			vh.Locations = append(vh.Locations, buildLocation(fs, vh, pg.path, up, pg.backends))
 		}
 		if !hasRoot && s.DefaultRoot != "none" {
 			vh.DefaultRoot = s.DefaultRoot
@@ -398,7 +427,7 @@ func buildUpstream(s Settings, host, path string, backends []backend) *Upstream 
 		up.Keepalive = strconv.Itoa(2 * len(up.Servers))
 	default:
 		if n, err := strconv.Atoi(keepalive); err == nil && n > 0 {
-			up.Keepalive = keepalive
+			up.Keepalive = strconv.Itoa(n)
 		} else {
 			warn("invalid keepalive label, using auto", "value", keepalive)
 			up.Keepalive = strconv.Itoa(2 * len(up.Servers))
@@ -407,12 +436,13 @@ func buildUpstream(s Settings, host, path string, backends []backend) *Upstream 
 	return up
 }
 
-func buildLocation(fs FS, vh *VHost, path string, up *Upstream, b backend) *Location {
+func buildLocation(fs FS, vh *VHost, path string, up *Upstream, backends []backend) *Location {
+	b := backends[0]
 	hash := sha1hex(path)
-	if p := VhostDir + "/" + vh.FileKey + "_" + hash + "_location_override"; fs.Exists(p) {
+	if p := vh.hostFile(fs, VhostDir, "_"+hash+"_location_override"); p != "" {
 		return &Location{Path: path, Override: p}
 	}
-	if p := VhostDir + "/" + vh.FileKey + "_location_override"; path == "/" && fs.Exists(p) {
+	if p := vh.hostFile(fs, VhostDir, "_location_override"); path == "/" && p != "" {
 		return &Location{Path: path, Override: p}
 	}
 	proto := envOr(b.env, "VIRTUAL_PROTO", "http")
@@ -428,31 +458,50 @@ func buildLocation(fs FS, vh *VHost, path string, up *Upstream, b backend) *Loca
 		Upstream:  up.Name,
 		Dest:      b.env["VIRTUAL_DEST"],
 		Root:      envOr(b.env, "VIRTUAL_ROOT", "/var/www/public"),
-		Internal:  b.env["NETWORK_ACCESS"] == "internal",
+		Internal:  internalOnly(vh.Host, backends),
 		Keepalive: up.Keepalive != "disabled",
 	}
-	switch {
-	case fs.Exists(HtpasswdDir + "/" + vh.FileKey + "_" + hash):
-		loc.AuthFile = HtpasswdDir + "/" + vh.FileKey + "_" + hash
+	if p := vh.hostFile(fs, HtpasswdDir, "_"+hash); p != "" {
+		loc.AuthFile = p
 		loc.AuthRealm = "Restricted " + vh.Host + path
-	case fs.Exists(HtpasswdDir + "/" + vh.FileKey):
-		loc.AuthFile = HtpasswdDir + "/" + vh.FileKey
+	} else if p := vh.hostFile(fs, HtpasswdDir, ""); p != "" {
+		loc.AuthFile = p
 		loc.AuthRealm = "Restricted " + vh.Host
-		if vh.IsRegex {
-			loc.AuthRealm = "Restricted access"
-		}
 	}
-	for _, p := range []string{
-		VhostDir + "/" + vh.FileKey + "_" + hash + "_location",
-		VhostDir + "/" + vh.FileKey + "_location",
-		VhostDir + "/default_location",
-	} {
-		if fs.Exists(p) {
-			loc.Include = p
-			break
-		}
+	// nginx expands variables in the realm and reads "\" as an escape, so a
+	// regex host or path cannot be shown in it: "$" at the end of a regex
+	// would even make nginx reject the configuration.
+	if loc.AuthFile != "" && (vh.IsRegex || strings.ContainsAny(loc.AuthRealm, `$\`)) {
+		loc.AuthRealm = "Restricted access"
+	}
+	if p := vh.hostFile(fs, VhostDir, "_"+hash+"_location"); p != "" {
+		loc.Include = p
+	} else if p := vh.hostFile(fs, VhostDir, "_location"); p != "" {
+		loc.Include = p
+	} else if fs.Exists(VhostDir + "/default_location") {
+		loc.Include = VhostDir + "/default_location"
 	}
 	return loc
+}
+
+// internalOnly reports whether a location is limited to internal clients
+// (NETWORK_ACCESS=internal). It fails closed: one of the containers behind
+// the location asking for it is enough, and a value that is neither
+// "internal" nor "external" restricts as well, so that a typo cannot publish
+// a service that was meant to stay internal.
+func internalOnly(host string, backends []backend) bool {
+	internal := false
+	for _, b := range backends {
+		switch v := strings.ToLower(strings.TrimSpace(b.env["NETWORK_ACCESS"])); v {
+		case "", "external":
+		case "internal":
+			internal = true
+		default:
+			warn("unknown NETWORK_ACCESS, treating it as internal", "container", b.ctr.ShortName(), "host", host, "value", v)
+			internal = true
+		}
+	}
+	return internal
 }
 
 // selectCert implements upstream's certificate selection: CERT_NAME, exact
@@ -464,11 +513,16 @@ func selectCert(fs FS, host, certName string) string {
 		}
 		return ""
 	}
-	if certUsable(fs, host) {
-		return host
+	// As for vhost.d and htpasswd, the lower-case spelling is tried as well.
+	for _, h := range fileKeys(host) {
+		if certUsable(fs, h) {
+			return h
+		}
 	}
-	if _, parent, ok := strings.Cut(host, "."); ok && strings.Contains(parent, ".") && certUsable(fs, parent) {
-		return parent
+	for _, h := range fileKeys(host) {
+		if _, parent, ok := strings.Cut(h, "."); ok && strings.Contains(parent, ".") && certUsable(fs, parent) {
+			return parent
+		}
 	}
 	return ""
 }
@@ -599,12 +653,18 @@ func labelBool(ctr *docker.Container, name string, def bool) bool {
 }
 
 var (
-	domainRe      = regexp.MustCompile(`^(?i)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
-	pathRe        = regexp.MustCompile(`^(/[A-Za-z0-9._~%/:@!&=+,-]*)?$`)
-	generatedRe   = regexp.MustCompile(`(?i)(^|-)[0-9a-f]{40}$`)
-	loadBalanceRe = regexp.MustCompile(`^(least_conn|ip_hash|random(\s+two(\s+least_conn)?)?|hash\s+[^\s;{}'"#\\]+(\s+consistent)?)\s*;$`)
-	sslPolicies   = []string{"", "Mozilla-Modern", "Mozilla-Intermediate", "Mozilla-Old"}
-	protos        = []string{"", "http", "https", "uwsgi", "fastcgi", "grpc", "grpcs"}
+	domainRe = regexp.MustCompile(`^(?i)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+	// plainHostRe is what a server name that is not a regular expression is
+	// made of: host name characters and the "*" of a wildcard name.
+	plainHostRe = regexp.MustCompile(`^[A-Za-z0-9._*-]+$`)
+	// namedCaptureRe finds a named group, (?<name>...) or (?P<name>...), but
+	// not the lookbehinds (?<=...) and (?<!...).
+	namedCaptureRe = regexp.MustCompile(`\(\?P?<[^=!]`)
+	pathRe         = regexp.MustCompile(`^(/[A-Za-z0-9._~%/:@!&=+,-]*)?$`)
+	generatedRe    = regexp.MustCompile(`(?i)(^|-)[0-9a-f]{40}$`)
+	loadBalanceRe  = regexp.MustCompile(`^(least_conn|ip_hash|random(\s+two(\s+least_conn)?)?|hash\s+[^\s;{}'"#\\]+(\s+consistent)?)\s*;$`)
+	sslPolicies    = []string{"", "Mozilla-Modern", "Mozilla-Intermediate", "Mozilla-Old"}
+	protos         = []string{"", "http", "https", "uwsgi", "fastcgi", "grpc", "grpcs"}
 )
 
 // ValidDomain reports whether d is a plain DNS name, safe to use as a file name.
@@ -615,7 +675,7 @@ func ValidDomain(d string) bool { return len(d) <= 253 && domainRe.MatchString(d
 // directives, so values outside a strict format reject the whole container.
 func validateContainer(env, labels map[string]string) error {
 	if !safeMatcher(env["VIRTUAL_PATH"]) {
-		return fmt.Errorf("VIRTUAL_PATH contains characters that are not allowed")
+		return fmt.Errorf("VIRTUAL_PATH contains characters that are not allowed, or a named capture")
 	}
 	// VIRTUAL_DEST is appended to the upstream name in proxy_pass: anything
 	// but a path would change the host nginx connects to (".evil.test/").
@@ -645,7 +705,8 @@ func validateContainer(env, labels map[string]string) error {
 	if strings.ContainsAny(env["HSTS"], "\"\\$\r\n{}#") {
 		return fmt.Errorf("HSTS contains characters that are not allowed")
 	}
-	if v := env["CERT_NAME"]; v != "" && (!safeToken(v) || strings.Contains(v, "/") || strings.Contains(v, "..")) {
+	// "$" is refused as nginx expands variables in ssl_certificate.
+	if v := env["CERT_NAME"]; v != "" && (!safeToken(v) || strings.ContainsAny(v, "/$") || strings.Contains(v, "..")) {
 		return fmt.Errorf("CERT_NAME must be a plain file name, got %q", v)
 	}
 	if v := strings.TrimSpace(labels[labelPrefix+"non-get-redirect"]); !slices.Contains([]string{"", "301", "302", "307", "308"}, v) {
@@ -669,11 +730,29 @@ func safeToken(s string) bool {
 // safeMatcher is safeToken for server names and locations, which may be
 // nginx regular expressions (a leading "~"). Those need backslashes, so
 // there one is only refused as the last character.
+//
+// Named captures are refused in them: a named group defines an nginx
+// variable for the whole configuration, replacing a map, geo or set variable
+// of the same name. A container could use that to empty a variable another
+// host's access rule or forwarded header depends on.
 func safeMatcher(s string) bool {
 	if !strings.HasPrefix(s, "~") {
 		return safeToken(s)
 	}
-	return !strings.ContainsAny(s, " \t\r\n;{}'\"#") && !strings.HasSuffix(s, `\`)
+	return !strings.ContainsAny(s, " \t\r\n;{}'\"#") && !strings.HasSuffix(s, `\`) && !namedCaptureRe.MatchString(s)
+}
+
+// safeHost reports whether a VIRTUAL_HOST entry can be used as a server
+// name. A plain or wildcard name is held to host name characters, because
+// it also names the upstream and the host's files: nginx expands variables
+// in proxy_pass, so "$http_x" as a host would let the client choose where
+// the proxy connects to, and "?" or "[" would turn an include into a glob.
+func safeHost(h string) bool {
+	if strings.HasPrefix(h, "~") {
+		return safeMatcher(h) && !strings.Contains(h, "/")
+	}
+	// "." and ".." are directories when used as a file name.
+	return plainHostRe.MatchString(h) && strings.Trim(h, ".") != ""
 }
 
 // hostKey is the name nginx sees for host: server and upstream names are
