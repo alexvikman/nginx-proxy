@@ -34,6 +34,7 @@ func TestParseTrustedProxies(t *testing.T) {
 func TestParseRealIPHeader(t *testing.T) {
 	lb, _ := ParseTrustedProxies("10.0.0.5")
 	cf, _ := ParseTrustedProxies("cloudflare")
+	both, _ := ParseTrustedProxies("cloudflare,10.0.0.5")
 	for _, tc := range []struct {
 		in      string
 		trusted TrustedProxies
@@ -44,10 +45,16 @@ func TestParseRealIPHeader(t *testing.T) {
 		{"", cf, "CF-Connecting-IP"},
 		{"X-Real-IP", cf, "X-Real-IP"},
 		{" CF-Connecting-IP ", lb, "CF-Connecting-IP"},
+		{"X-Forwarded-For", both, "X-Forwarded-For"},
+		{"CF-Connecting-IP", both, "CF-Connecting-IP"},
 	} {
 		if got, err := ParseRealIPHeader(tc.in, tc.trusted); err != nil || got != tc.want {
 			t.Errorf("%q: got %q, %v, want %q", tc.in, got, err, tc.want)
 		}
+	}
+	// Each default can be forged in a mixed setup: the operator must choose.
+	if _, err := ParseRealIPHeader("", both); err == nil {
+		t.Error("cloudflare with other proxies must require REAL_IP_HEADER")
 	}
 	for _, bad := range []string{"X-Forwarded-For;", "a b", "X_Real_IP", strings.Repeat("a", 65)} {
 		if _, err := ParseRealIPHeader(bad, lb); err == nil {
@@ -63,7 +70,7 @@ func TestSettingsRefuseInvalidTrustedProxies(t *testing.T) {
 }
 
 func TestTrustedProxiesReplaceDownstreamTrust(t *testing.T) {
-	s, err := SettingsFromEnv(map[string]string{"TRUSTED_PROXIES": "10.0.0.5,cloudflare", "TRUST_DOWNSTREAM_PROXY": "true"})
+	s, err := SettingsFromEnv(map[string]string{"TRUSTED_PROXIES": "10.0.0.5,cloudflare", "REAL_IP_HEADER": "CF-Connecting-IP", "TRUST_DOWNSTREAM_PROXY": "true"})
 	if err != nil {
 		t.Fatal(err)
 	}

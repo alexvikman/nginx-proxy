@@ -61,17 +61,19 @@ docker run -d --label "$RUN_ID" --name "$RUN_ID-echo" --network "$NET" \
 	-v "$WORK/echo.conf:/echo.conf:ro" \
 	--entrypoint nginx "$IMAGE" -c /echo.conf -g 'daemon off;' >/dev/null
 
-proxy() { # name TRUSTED_PROXIES
+proxy() { # name TRUSTED_PROXIES REAL_IP_HEADER
 	docker create --label "$RUN_ID" --name "$RUN_ID-$1" --network "$NET" \
 		--cap-drop ALL --cap-add CHOWN --cap-add SETGID --cap-add SETUID --cap-add NET_BIND_SERVICE \
 		--security-opt no-new-privileges \
 		-v /var/run/docker.sock:/tmp/docker.sock:ro \
-		-e ENABLE_ACME=false -e TRUSTED_PROXIES="$2" \
+		-e ENABLE_ACME=false -e TRUSTED_PROXIES="$2" -e REAL_IP_HEADER="$3" \
 		"$IMAGE" >/dev/null
 }
-proxy proxy "cloudflare,$LB_IP"
+# Cloudflare in front of the load balancer: every request comes through
+# Cloudflare, so the client address is CF-Connecting-IP.
+proxy proxy "cloudflare,$LB_IP" CF-Connecting-IP
 docker network connect "$EDGE_NET" "$RUN_ID-proxy"
-proxy lbonly "$LB_IP"
+proxy lbonly "$LB_IP" ""
 docker start "$RUN_ID-proxy" "$RUN_ID-lbonly" >/dev/null
 
 client() { # name network ip
@@ -106,7 +108,6 @@ expect() { # NAME GOT WANT
 
 headers=(-H "CF-Connecting-IP: 203.0.113.7" -H "X-Forwarded-For: 198.51.100.1" -H "X-Forwarded-Proto: https" -H "X-Forwarded-Host: shop.example" -H "X-Forwarded-Port: 443")
 
-# With "cloudflare" trusted, the client address comes from CF-Connecting-IP.
 expect "a proxy listed by address has all its headers believed" \
 	"$(ask lb "$PROXY" "${headers[@]}")" \
 	"xff=203.0.113.7 real=203.0.113.7 proto=https host=shop.example port=443"
@@ -135,12 +136,18 @@ for p in proxy lbonly; do
 	if [[ "$(docker logs "$RUN_ID-$p" 2>&1)" == *"nginx -t rejected"* ]]; then fail "nginx rejected the configuration of $p"; fi
 done
 
-# An invalid TRUSTED_PROXIES must stop the proxy instead of being ignored.
-if docker run --rm --label "$RUN_ID" -e TRUSTED_PROXIES=0.0.0.0/0 -v /var/run/docker.sock:/tmp/docker.sock:ro "$IMAGE" >/dev/null 2>&1; then
-	fail "TRUSTED_PROXIES=0.0.0.0/0 was accepted"
-else
-	ok "an invalid TRUSTED_PROXIES stops the proxy"
-fi
+# Settings that would leave the proxy less strict than asked stop it.
+refused() { # NAME ENV...
+	local name="$1"
+	shift
+	if docker run --rm --label "$RUN_ID" "$@" -v /var/run/docker.sock:/tmp/docker.sock:ro "$IMAGE" >/dev/null 2>&1; then
+		fail "$name was accepted"
+	else
+		ok "$name stops the proxy"
+	fi
+}
+refused "TRUSTED_PROXIES=0.0.0.0/0" -e TRUSTED_PROXIES=0.0.0.0/0
+refused "cloudflare with another proxy and no REAL_IP_HEADER" -e TRUSTED_PROXIES="cloudflare,$LB_IP"
 
 echo "passed: $PASS, failed: $FAIL"
 ((FAIL == 0))

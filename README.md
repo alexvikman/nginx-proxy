@@ -148,7 +148,7 @@ that container, which must be visible to the proxy.
 | `ENABLE_IPV6` | `false` | Also listen on `[::]`. |
 | `PREFER_IPV6_NETWORK` | `false` | Reach containers over IPv6 when they have an address. |
 | `TRUSTED_PROXIES` | | Addresses and CIDR ranges of the proxies in front, separated by commas, and `cloudflare` for [Cloudflare's ranges](https://www.cloudflare.com/ips/). Only requests from these get their client address and `X-Forwarded-*` headers believed; from Cloudflare, only the client address and scheme. Replaces `TRUST_DOWNSTREAM_PROXY`. See [Behind a CDN or load balancer](#behind-a-cdn-or-load-balancer). |
-| `REAL_IP_HEADER` | `CF-Connecting-IP` with `cloudflare` in `TRUSTED_PROXIES`, else `X-Forwarded-For` | Header the trusted proxies put the client address in. |
+| `REAL_IP_HEADER` | `CF-Connecting-IP` when `TRUSTED_PROXIES` is only `cloudflare`, `X-Forwarded-For` without `cloudflare` | Header the trusted proxies put the client address in. Required when `TRUSTED_PROXIES` lists `cloudflare` and other proxies. |
 | `TRUST_DOWNSTREAM_PROXY` | `true` | Forward client-supplied `X-Forwarded-*` headers. Set to `false` unless another proxy sits in front: the headers, `X-Forwarded-For` included, are then set from the connection alone. Ignored when `TRUSTED_PROXIES` is set. |
 | `TRUST_DEFAULT_CERT` | `true` | Use `default.crt` for hosts without their own certificate. |
 | `ENABLE_HTTP_ON_MISSING_CERT` | `true` | |
@@ -190,6 +190,16 @@ their choosing. From these addresses the proxy only believes what Cloudflare
 sets itself: the client address in `CF-Connecting-IP` (the default
 `REAL_IP_HEADER` when `cloudflare` is listed) and `X-Forwarded-Proto`.
 `X-Forwarded-Host` and `-Port` come from the request itself.
+
+**Both** `cloudflare` and your own proxies, for example Cloudflare in front
+of a load balancer, require `REAL_IP_HEADER`, because each choice can be
+forged in some setups:
+
+- `CF-Connecting-IP` if every request reaches your proxies through
+  Cloudflare. A client that can reach them directly could set it itself.
+- `X-Forwarded-For` if your proxies also take requests that do not come
+  through Cloudflare. A request through another Cloudflare customer's zone
+  can then forge the client address, as above.
 
 Any other request, such as one sent straight to your server's address to get
 around Cloudflare, gets its own address and this server's scheme, host and

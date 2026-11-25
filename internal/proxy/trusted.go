@@ -100,13 +100,25 @@ func ParseTrustedProxies(v string) (TrustedProxies, error) {
 func (t TrustedProxies) Empty() bool { return len(t.Ranges) == 0 && len(t.Cloudflare) == 0 }
 
 // ParseRealIPHeader reads REAL_IP_HEADER, the request header a trusted
-// proxy puts the client address in. The default is CF-Connecting-IP when
-// Cloudflare is trusted: Cloudflare sets it to the address it saw, whereas
-// X-Forwarded-For keeps whatever the sender wrote in front of it.
+// proxy puts the client address in.
+//
+// The default depends on who is trusted. With only Cloudflare, it is
+// CF-Connecting-IP: Cloudflare sets it to the address it saw, whereas
+// X-Forwarded-For keeps whatever the sender wrote in front, which a request
+// through another customer's zone can use. With only listed proxies, it is
+// X-Forwarded-For, which they append to. With both, neither is safe for
+// every setup, so it must be chosen: CF-Connecting-IP can be forged by a
+// client that reaches a listed proxy without going through Cloudflare, and
+// X-Forwarded-For through another Cloudflare customer's zone.
 func ParseRealIPHeader(v string, t TrustedProxies) (string, error) {
 	v = strings.TrimSpace(v)
 	if v == "" {
-		if len(t.Cloudflare) > 0 {
+		switch {
+		case len(t.Cloudflare) > 0 && len(t.Ranges) > 0:
+			return "", fmt.Errorf("TRUSTED_PROXIES lists cloudflare and other proxies, so set REAL_IP_HEADER: " +
+				"CF-Connecting-IP if every request reaches those proxies through Cloudflare, " +
+				"X-Forwarded-For if they also take requests that do not")
+		case len(t.Cloudflare) > 0:
 			return "CF-Connecting-IP", nil
 		}
 		return "X-Forwarded-For", nil
