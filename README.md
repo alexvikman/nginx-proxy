@@ -37,6 +37,8 @@ services:
     environment:
       DEFAULT_EMAIL: ops@example.com
       TRUST_DOWNSTREAM_PROXY: "false" # no other proxy in front of this one
+      # Behind Cloudflare or a load balancer, use this instead:
+      # TRUSTED_PROXIES: cloudflare
     volumes:
       - /var/run/docker.sock:/tmp/docker.sock:ro
       - certs:/etc/nginx/certs
@@ -145,7 +147,9 @@ that container, which must be visible to the proxy.
 | `ENABLE_HTTP2` | `true` | |
 | `ENABLE_IPV6` | `false` | Also listen on `[::]`. |
 | `PREFER_IPV6_NETWORK` | `false` | Reach containers over IPv6 when they have an address. |
-| `TRUST_DOWNSTREAM_PROXY` | `true` | Forward client-supplied `X-Forwarded-*` headers. Set to `false` unless another proxy sits in front: the headers, `X-Forwarded-For` included, are then set from the connection alone. |
+| `TRUSTED_PROXIES` | | Addresses and CIDR ranges of the proxies in front, separated by commas, and `cloudflare` for [Cloudflare's ranges](https://www.cloudflare.com/ips/). Only requests from these get their client address and `X-Forwarded-*` headers believed. Replaces `TRUST_DOWNSTREAM_PROXY`. See [Behind a CDN or load balancer](#behind-a-cdn-or-load-balancer). |
+| `REAL_IP_HEADER` | `X-Forwarded-For` | Header the trusted proxies put the client address in, e.g. `CF-Connecting-IP`. |
+| `TRUST_DOWNSTREAM_PROXY` | `true` | Forward client-supplied `X-Forwarded-*` headers. Set to `false` unless another proxy sits in front: the headers, `X-Forwarded-For` included, are then set from the connection alone. Ignored when `TRUSTED_PROXIES` is set. |
 | `TRUST_DEFAULT_CERT` | `true` | Use `default.crt` for hosts without their own certificate. |
 | `ENABLE_HTTP_ON_MISSING_CERT` | `true` | |
 | `NON_GET_REDIRECT` | `301` | |
@@ -158,6 +162,36 @@ that container, which must be visible to the proxy.
 | `ENABLE_ACME` | `true` | Built-in ACME client. |
 | `ACME_CA_URI` | Let's Encrypt production | ACME directory URL. |
 | `DEFAULT_EMAIL` | | ACME account contact. |
+
+### Behind a CDN or load balancer
+
+When Cloudflare, a load balancer or another proxy sits in front, list it in
+`TRUSTED_PROXIES` instead of setting `TRUST_DOWNSTREAM_PROXY=true`:
+
+```yaml
+    environment:
+      TRUSTED_PROXIES: cloudflare            # or e.g. 10.0.0.0/8,192.0.2.10
+```
+
+For a request that comes from one of the listed ranges, the proxy:
+
+- takes the client address from `X-Forwarded-For` (or `REAL_IP_HEADER`),
+  skipping the trusted addresses from the right, so addresses a client put
+  in front are ignored. It becomes `$remote_addr`, so the access log,
+  `NETWORK_ACCESS=internal` and the `X-Real-IP` and `X-Forwarded-For` headers
+  sent to your application all show the real client;
+- passes on `X-Forwarded-Proto` (`http` or `https` only), `-Host` and `-Port`.
+
+Any other request, such as one sent straight to your server's address to get
+around Cloudflare, gets its own address and this server's scheme, host and
+port, whatever headers it sends. Your application receives a single address
+in `X-Forwarded-For`: the client's, not the chain of proxies.
+
+With Cloudflare, use the SSL/TLS mode *Full (strict)*. In *Flexible* mode
+Cloudflare connects over plain HTTP, the proxy redirects it to HTTPS, and
+browsers end up in a redirect loop.
+The built-in Cloudflare ranges are updated in this repository when
+Cloudflare announces a change.
 
 ### Files
 
@@ -237,10 +271,12 @@ case for a named volume. A bind-mounted directory of another user needs a
 `chown` to root, or `DAC_OVERRIDE` added.
 
 **Forwarded headers.** With the default `TRUST_DOWNSTREAM_PROXY=true`, the
-`X-Forwarded-Proto`, `-Host`, `-Port` and `-For` values a client sends reach
-your application, which may use them for redirects, links or the client
-address. Keep the default only when a load balancer or CDN in front of the
-proxy sets these headers.
+`X-Forwarded-Proto`, `-Host`, `-Port` and `-For` values any client sends
+reach your application, which may use them for redirects, links or the
+client address. With a CDN or load balancer in front, set `TRUSTED_PROXIES`
+instead, so only it is believed (see
+[Behind a CDN or load balancer](#behind-a-cdn-or-load-balancer)). Without
+one, set `TRUST_DOWNSTREAM_PROXY=false`.
 
 **`NETWORK_ACCESS=internal`** compares the address nginx sees with
 `network_internal.conf`. Where Docker does not preserve the client address
@@ -302,6 +338,7 @@ go test ./...                       # unit tests
 docker build -t nginx-proxy:test .  # image
 test/integration.sh                 # routing, TLS, events, rollback
 test/acme.sh                        # ACME against Pebble
+test/trusted-proxies.sh             # forwarded headers from TRUSTED_PROXIES
 ```
 
 Code layout:

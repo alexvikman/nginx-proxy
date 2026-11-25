@@ -53,7 +53,13 @@ func run() error {
 	defer stop()
 
 	env := environ()
-	settings := proxy.SettingsFromEnv(env)
+	settings, err := proxy.SettingsFromEnv(env)
+	if err != nil {
+		return err
+	}
+	if len(settings.TrustedProxies) > 0 {
+		slog.Info("forwarded headers are only believed from TRUSTED_PROXIES", "ranges", len(settings.TrustedProxies), "client_address_from", settings.RealIPHeader)
+	}
 	dockerHost := env["DOCKER_HOST"]
 	if dockerHost == "" {
 		dockerHost = "unix:///var/run/docker.sock"

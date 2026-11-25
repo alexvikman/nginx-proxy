@@ -73,3 +73,5 @@ jobs:
         run: test/integration.sh nginx-proxy:test
       - name: Built-in ACME against Pebble
         run: test/acme.sh nginx-proxy:test
+      - name: Forwarded headers from TRUSTED_PROXIES
+        run: test/trusted-proxies.sh nginx-proxy:test
