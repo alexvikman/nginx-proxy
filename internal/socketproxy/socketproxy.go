@@ -15,6 +15,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -56,6 +57,11 @@ func FilterID(envKeys []string, labelPrefix string) string {
 // inspect: no slashes, dots only after the first character.
 var containerRef = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
 
+// summary is what nginx-proxy reads of a container list entry.
+type summary struct {
+	ID string `json:"Id"`
+}
+
 // Options configure a Handler.
 type Options struct {
 	// EnvKeys are the container environment variables passed on; all
@@ -68,6 +74,11 @@ type Options struct {
 	ContainerFilters map[string][]string
 	// Version is reported in VersionHeader.
 	Version string
+	// SelfID is the socket proxy's own container, "" when unknown. With
+	// ContainerFilters set, a container that shares a network with it may
+	// be inspected although the filters exclude it: that is how nginx-proxy
+	// finds its own container.
+	SelfID string
 }
 
 // Handler forwards allowed requests to the Docker API.
@@ -82,6 +93,7 @@ type Handler struct {
 	// guess at a time.
 	listFilters  string
 	eventFilters string
+	selfID       string
 	filterID     string
 	version      string
 	slots        chan struct{}
@@ -104,6 +116,7 @@ func New(dockerHost string, o Options) (*Handler, error) {
 		labelPrefix:  o.LabelPrefix,
 		listFilters:  canonicalFilters(o.ContainerFilters),
 		eventFilters: canonicalFilters(docker.EventFilters()),
+		selfID:       o.SelfID,
 		filterID:     FilterID(o.EnvKeys, o.LabelPrefix),
 		version:      o.Version,
 		slots:        make(chan struct{}, maxInFlight),
@@ -279,9 +292,7 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-	var summaries []struct {
-		ID string `json:"Id"`
-	}
+	var summaries []summary
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponse)).Decode(&summaries); err != nil {
 		writeError(w, http.StatusBadGateway, "unexpected response from Docker")
 		return
@@ -304,6 +315,20 @@ func (h *Handler) inspect(w http.ResponseWriter, r *http.Request, ref string) {
 		writeError(w, http.StatusBadGateway, "unexpected response from Docker")
 		return
 	}
+	if h.listFilters != "" {
+		visible, err := h.visible(ctx, &ctr)
+		if err != nil {
+			slog.Error("Docker API request failed", "err", err)
+			writeError(w, http.StatusBadGateway, "Docker API unreachable")
+			return
+		}
+		if !visible {
+			// The same answer as for a container that does not exist, so
+			// the filters cannot be probed by name either.
+			writeError(w, http.StatusNotFound, "No such container: "+ref)
+			return
+		}
+	}
 	ctr.Config.Env = slices.DeleteFunc(ctr.Config.Env, func(kv string) bool {
 		k, _, _ := strings.Cut(kv, "=")
 		return !h.envKeys[k]
@@ -314,6 +339,48 @@ func (h *Handler) inspect(w http.ResponseWriter, r *http.Request, ref string) {
 		}
 	}
 	writeJSON(w, &ctr)
+}
+
+// visible reports whether ctr passes the container filters, stopped
+// containers included, or shares a network with the socket proxy.
+func (h *Handler) visible(ctx context.Context, ctr *docker.Container) (bool, error) {
+	q := withFilters(h.listFilters)
+	q.Set("all", "1")
+	var listed []summary
+	if err := h.getJSON(ctx, "/containers/json", q, &listed); err != nil {
+		return false, err
+	}
+	if slices.Contains(listed, summary{ID: ctr.ID}) {
+		return true, nil
+	}
+	if h.selfID == "" {
+		return false, nil
+	}
+	var self docker.Container
+	if err := h.getJSON(ctx, "/containers/"+h.selfID+"/json", nil, &self); err != nil {
+		return false, err
+	}
+	for _, mine := range self.NetworkSettings.Networks {
+		for _, theirs := range ctr.NetworkSettings.Networks {
+			if mine.NetworkID != "" && mine.NetworkID == theirs.NetworkID {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// getJSON decodes a 200 response from Docker into out.
+func (h *Handler) getJSON(ctx context.Context, path string, q url.Values, out any) error {
+	resp, err := h.get(ctx, path, q)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s: status %d", path, resp.StatusCode)
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, maxResponse)).Decode(out)
 }
 
 func (h *Handler) events(w http.ResponseWriter, r *http.Request) {

@@ -305,6 +305,11 @@ for a label or image the responses leave out. Set `DOCKER_CONTAINER_FILTERS`
 on the socket proxy, and the same value on the proxy. When the two differ,
 the socket proxy refuses the list and both log why.
 
+With `DOCKER_CONTAINER_FILTERS` set, a container the filters exclude cannot
+be inspected either: the socket proxy answers as if it did not exist. The
+one exception is a container on a network the socket proxy is on, which is
+how the proxy finds its own container when the filters exclude it.
+
 The socket proxy listens on `SOCKET_PROXY_LISTEN` (default `:2375`) without
 TLS or authentication. Publish no port for it and keep it on an `internal`
 network that only the proxy shares. Any container on that network can make

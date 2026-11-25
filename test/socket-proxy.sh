@@ -11,6 +11,9 @@ IMAGE="${1:-nginx-proxy:test}"
 RUN_ID="np-sp-$$"
 NET="$RUN_ID"
 DOCKER_NET="$RUN_ID-docker"
+# Only backends carry this label. The proxy does not, so it can only inspect
+# itself because it shares the socket proxy's network.
+FILTERS="label=$RUN_ID.route"
 PASS=0
 FAIL=0
 
@@ -33,7 +36,7 @@ fail() { echo "FAIL $1"; FAIL=$((FAIL + 1)); }
 backend() { # name, extra docker args...
 	local name="$1"
 	shift
-	docker run -d --label "$RUN_ID" --name "$RUN_ID-$name" --network "$NET" "$@" \
+	docker run -d --label "$RUN_ID" --label "$RUN_ID.route=yes" --name "$RUN_ID-$name" --network "$NET" "$@" \
 		docker.io/library/busybox:stable \
 		sh -c "mkdir /www && echo hello-$name > /www/index.html && exec httpd -f -p 8080 -h /www" >/dev/null
 }
@@ -61,13 +64,14 @@ docker run -d --label "$RUN_ID" --name "$RUN_ID-socket-proxy" \
 	--network "$DOCKER_NET" --network-alias socket-proxy \
 	--cap-drop ALL --security-opt no-new-privileges --read-only \
 	-v /var/run/docker.sock:/tmp/docker.sock:ro \
+	-e DOCKER_CONTAINER_FILTERS="$FILTERS" \
 	"$IMAGE" socket-proxy >/dev/null
 
 # The proxy and a client both join the internal network before they start.
 docker create --label "$RUN_ID" --name "$RUN_ID-proxy" --network "$NET" \
 	--cap-drop ALL --cap-add CHOWN --cap-add SETGID --cap-add SETUID --cap-add NET_BIND_SERVICE \
 	--security-opt no-new-privileges \
-	-e DOCKER_HOST=tcp://socket-proxy:2375 -e ENABLE_ACME=false \
+	-e DOCKER_HOST=tcp://socket-proxy:2375 -e ENABLE_ACME=false -e DOCKER_CONTAINER_FILTERS="$FILTERS" \
 	"$IMAGE" >/dev/null
 docker create --label "$RUN_ID" --name "$RUN_ID-client" --network "$NET" \
 	--entrypoint sleep "$IMAGE" infinity >/dev/null
@@ -90,6 +94,12 @@ if [[ "$inspect" != *s3cr3t-value* && "$inspect" != *DB_PASSWORD* && "$inspect" 
 else
 	fail "inspect passes on secrets: $inspect"
 fi
+
+# A container the filters exclude does not exist as far as the proxy can tell.
+docker run -d --label "$RUN_ID" --name "$RUN_ID-hidden" --network "$NET" -e VIRTUAL_HOST=hidden.test \
+	docker.io/library/busybox:stable sleep 600 >/dev/null
+code="$(kurl -o /dev/null -w '%{http_code}' "http://socket-proxy:2375/containers/$RUN_ID-hidden/json")"
+if [[ "$code" == 404 ]]; then ok "containers outside DOCKER_CONTAINER_FILTERS cannot be inspected"; else fail "inspect of an excluded container: want 404, got $code"; fi
 
 for req in "POST /containers/create" "POST /containers/$RUN_ID-app/stop" "GET /info" "GET /containers/$RUN_ID-app/logs"; do
 	code="$(kurl -o /dev/null -w '%{http_code}' -X "${req% *}" "http://socket-proxy:2375${req#* }")"

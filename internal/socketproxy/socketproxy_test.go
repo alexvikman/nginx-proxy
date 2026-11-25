@@ -52,7 +52,17 @@ func fakeDocker(t *testing.T) (*httptest.Server, *recorder) {
 		case "/_ping":
 			io.WriteString(w, "OK")
 		case "/containers/json":
+			// Filters on "route=no" match nothing; any others match app.
+			if strings.Contains(r.URL.Query().Get("filters"), "route=no") {
+				io.WriteString(w, `[]`)
+				return
+			}
 			io.WriteString(w, `[{"Id":"abc123","Names":["/app"],"Labels":{"com.example.secret":"s3cr3t"}}]`)
+		case "/containers/peer/json":
+			// A container on the socket proxy's network, like nginx-proxy.
+			io.WriteString(w, `{"Id":"peer456","Name":"/peer","State":{"Running":true},"NetworkSettings":{"Networks":{"docker-api":{"NetworkID":"n-api"}}}}`)
+		case "/containers/sp/json":
+			io.WriteString(w, `{"Id":"sp789","Name":"/socket-proxy","State":{"Running":true},"NetworkSettings":{"Networks":{"docker-api":{"NetworkID":"n-api"}}}}`)
 		case "/containers/abc123/json":
 			io.WriteString(w, inspectBody)
 		case "/containers/gone/json":
@@ -75,13 +85,16 @@ func fakeDocker(t *testing.T) (*httptest.Server, *recorder) {
 // is its DOCKER_CONTAINER_FILTERS.
 func newProxy(t *testing.T, filters map[string][]string) (*httptest.Server, *recorder) {
 	t.Helper()
+	return newProxyWith(t, Options{ContainerFilters: filters})
+}
+
+func newProxyWith(t *testing.T, o Options) (*httptest.Server, *recorder) {
+	t.Helper()
 	docker, seen := fakeDocker(t)
-	h, err := New("tcp://"+strings.TrimPrefix(docker.URL, "http://"), Options{
-		EnvKeys:          []string{"VIRTUAL_HOST", "VIRTUAL_PORT"},
-		LabelPrefix:      "com.github.nginx-proxy.nginx-proxy.",
-		ContainerFilters: filters,
-		Version:          "1.2.3",
-	})
+	o.EnvKeys = []string{"VIRTUAL_HOST", "VIRTUAL_PORT"}
+	o.LabelPrefix = "com.github.nginx-proxy.nginx-proxy."
+	o.Version = "1.2.3"
+	h, err := New("tcp://"+strings.TrimPrefix(docker.URL, "http://"), o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,5 +277,54 @@ func TestTheSocketProxyChoosesTheFilters(t *testing.T) {
 		if f := u.Query().Get("filters"); f != `{"label":["a=1","b=2"]}` {
 			t.Errorf("Docker must get the socket proxy's filters, got %q", f)
 		}
+	}
+}
+
+func TestInspectFollowsTheFilters(t *testing.T) {
+	excluding := map[string][]string{"label": {"route=no"}}
+	status := func(srv *httptest.Server, ref string) int {
+		resp, err := http.Get(srv.URL + "/containers/" + ref + "/json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	for _, tc := range []struct {
+		name      string
+		o         Options
+		app, peer int
+	}{
+		{"no filters", Options{}, 200, 200},
+		{"app matches, peer does not", Options{ContainerFilters: map[string][]string{"label": {"route=yes"}}}, 200, 404},
+		{"excluded, own container unknown", Options{ContainerFilters: excluding}, 404, 404},
+		// nginx-proxy shares the socket proxy's network, so it can still
+		// inspect itself when the filters exclude it.
+		{"excluded, peer on the socket proxy's network", Options{ContainerFilters: excluding, SelfID: "sp"}, 404, 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _ := newProxyWith(t, tc.o)
+			if got := status(srv, "abc123"); got != tc.app {
+				t.Errorf("app: got %d, want %d", got, tc.app)
+			}
+			if got := status(srv, "peer"); got != tc.peer {
+				t.Errorf("peer: got %d, want %d", got, tc.peer)
+			}
+		})
+	}
+
+	// The visibility check lists stopped containers too, with the socket
+	// proxy's filters.
+	srv, seen := newProxyWith(t, Options{ContainerFilters: excluding})
+	status(srv, "abc123")
+	var list string
+	for _, r := range seen.all() {
+		if strings.Contains(r, "/containers/json") {
+			list = r
+		}
+	}
+	u, _ := url.ParseRequestURI(strings.TrimPrefix(list, "GET "))
+	if u == nil || u.Query().Get("all") != "1" || u.Query().Get("filters") != `{"label":["route=no"]}` {
+		t.Errorf("unexpected visibility check %q", list)
 	}
 }

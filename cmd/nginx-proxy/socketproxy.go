@@ -31,11 +31,24 @@ func runSocketProxy() error {
 	if listen == "" {
 		listen = ":2375"
 	}
+	filters := docker.ParseFilters(os.Getenv("DOCKER_CONTAINER_FILTERS"))
+	cli, err := docker.New(dockerHost)
+	if err != nil {
+		return err
+	}
+	if err := waitForDocker(ctx, cli); err != nil {
+		return err
+	}
+	selfID := docker.SelfID(ctx, cli)
+	if selfID == "" && len(filters) > 0 {
+		slog.Warn("could not determine the socket proxy's own container; only containers that match DOCKER_CONTAINER_FILTERS can be inspected, so nginx-proxy may not find its own container")
+	}
 	h, err := socketproxy.New(dockerHost, socketproxy.Options{
 		EnvKeys:          proxy.ContainerEnv,
 		LabelPrefix:      proxy.LabelPrefix,
-		ContainerFilters: docker.ParseFilters(os.Getenv("DOCKER_CONTAINER_FILTERS")),
+		ContainerFilters: filters,
 		Version:          os.Getenv("NGINX_PROXY_VERSION"),
+		SelfID:           selfID,
 	})
 	if err != nil {
 		return err
