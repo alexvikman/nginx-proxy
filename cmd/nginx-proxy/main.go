@@ -57,8 +57,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if len(settings.TrustedProxies) > 0 {
-		slog.Info("forwarded headers are only believed from TRUSTED_PROXIES", "ranges", len(settings.TrustedProxies), "client_address_from", settings.RealIPHeader)
+	if t := settings.TrustedProxies; !t.Empty() {
+		slog.Info("forwarded headers are only believed from TRUSTED_PROXIES",
+			"ranges", len(t.Ranges), "cloudflare", len(t.Cloudflare) > 0, "client_address_from", settings.RealIPHeader)
 	}
 	dockerHost := env["DOCKER_HOST"]
 	if dockerHost == "" {

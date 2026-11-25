@@ -39,29 +39,44 @@ var CloudflareRanges = []string{
 
 var headerName = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
 
+// TrustedProxies is the parsed TRUSTED_PROXIES.
+type TrustedProxies struct {
+	// Ranges are the proxies listed by address or range: the operator's
+	// own load balancers. Every X-Forwarded-* header they send is believed.
+	Ranges []string
+	// Cloudflare holds CloudflareRanges when the "cloudflare" keyword was
+	// given, minus any range also listed in Ranges. These addresses are
+	// shared by every Cloudflare customer, so anyone can send requests from
+	// them with headers of their choosing, through a zone of their own that
+	// points at this server. Only what Cloudflare sets itself is believed
+	// from them: the client address in CF-Connecting-IP and the scheme.
+	Cloudflare []string
+}
+
 // ParseTrustedProxies reads TRUSTED_PROXIES: addresses and CIDR ranges of
 // the proxies in front of this one, separated by commas or spaces, and the
-// keyword "cloudflare". It returns normalised, de-duplicated ranges.
-func ParseTrustedProxies(v string) ([]string, error) {
-	var out []string
+// keyword "cloudflare". Ranges are normalised and de-duplicated.
+func ParseTrustedProxies(v string) (TrustedProxies, error) {
+	var t TrustedProxies
+	cloudflare := false
 	for item := range strings.FieldsFuncSeq(v, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\n' }) {
 		if strings.EqualFold(item, "cloudflare") {
-			out = append(out, CloudflareRanges...)
+			cloudflare = true
 			continue
 		}
 		var p netip.Prefix
 		if strings.Contains(item, "/") {
 			var err error
 			if p, err = netip.ParsePrefix(item); err != nil {
-				return nil, fmt.Errorf("TRUSTED_PROXIES: %q is not an address or CIDR range", item)
+				return TrustedProxies{}, fmt.Errorf("TRUSTED_PROXIES: %q is not an address or CIDR range", item)
 			}
 		} else {
 			a, err := netip.ParseAddr(item)
 			if err != nil {
-				return nil, fmt.Errorf("TRUSTED_PROXIES: %q is not an address or CIDR range", item)
+				return TrustedProxies{}, fmt.Errorf("TRUSTED_PROXIES: %q is not an address or CIDR range", item)
 			}
 			if a.Zone() != "" {
-				return nil, fmt.Errorf("TRUSTED_PROXIES: %q has a zone, which nginx does not accept", item)
+				return TrustedProxies{}, fmt.Errorf("TRUSTED_PROXIES: %q has a zone, which nginx does not accept", item)
 			}
 			p = netip.PrefixFrom(a, a.BitLen())
 		}
@@ -69,25 +84,31 @@ func ParseTrustedProxies(v string) ([]string, error) {
 			// Every client would be believed: the same as
 			// TRUST_DOWNSTREAM_PROXY=true, but with a forgeable client
 			// address on top. Refuse rather than guess.
-			return nil, fmt.Errorf("TRUSTED_PROXIES: %q trusts every client; list the proxies in front instead", item)
+			return TrustedProxies{}, fmt.Errorf("TRUSTED_PROXIES: %q trusts every client; list the proxies in front instead", item)
 		}
-		out = append(out, p.Masked().String())
+		if r := p.Masked().String(); !slices.Contains(t.Ranges, r) {
+			t.Ranges = append(t.Ranges, r)
+		}
 	}
-	seen := map[string]bool{}
-	return slices.DeleteFunc(out, func(p string) bool {
-		if seen[p] {
-			return true
-		}
-		seen[p] = true
-		return false
-	}), nil
+	if cloudflare {
+		t.Cloudflare = slices.DeleteFunc(slices.Clone(CloudflareRanges), func(r string) bool { return slices.Contains(t.Ranges, r) })
+	}
+	return t, nil
 }
 
+// Empty reports whether no proxy is trusted.
+func (t TrustedProxies) Empty() bool { return len(t.Ranges) == 0 && len(t.Cloudflare) == 0 }
+
 // ParseRealIPHeader reads REAL_IP_HEADER, the request header a trusted
-// proxy puts the client address in.
-func ParseRealIPHeader(v string) (string, error) {
+// proxy puts the client address in. The default is CF-Connecting-IP when
+// Cloudflare is trusted: Cloudflare sets it to the address it saw, whereas
+// X-Forwarded-For keeps whatever the sender wrote in front of it.
+func ParseRealIPHeader(v string, t TrustedProxies) (string, error) {
 	v = strings.TrimSpace(v)
 	if v == "" {
+		if len(t.Cloudflare) > 0 {
+			return "CF-Connecting-IP", nil
+		}
 		return "X-Forwarded-For", nil
 	}
 	if !headerName.MatchString(v) {

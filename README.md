@@ -147,8 +147,8 @@ that container, which must be visible to the proxy.
 | `ENABLE_HTTP2` | `true` | |
 | `ENABLE_IPV6` | `false` | Also listen on `[::]`. |
 | `PREFER_IPV6_NETWORK` | `false` | Reach containers over IPv6 when they have an address. |
-| `TRUSTED_PROXIES` | | Addresses and CIDR ranges of the proxies in front, separated by commas, and `cloudflare` for [Cloudflare's ranges](https://www.cloudflare.com/ips/). Only requests from these get their client address and `X-Forwarded-*` headers believed. Replaces `TRUST_DOWNSTREAM_PROXY`. See [Behind a CDN or load balancer](#behind-a-cdn-or-load-balancer). |
-| `REAL_IP_HEADER` | `X-Forwarded-For` | Header the trusted proxies put the client address in, e.g. `CF-Connecting-IP`. |
+| `TRUSTED_PROXIES` | | Addresses and CIDR ranges of the proxies in front, separated by commas, and `cloudflare` for [Cloudflare's ranges](https://www.cloudflare.com/ips/). Only requests from these get their client address and `X-Forwarded-*` headers believed; from Cloudflare, only the client address and scheme. Replaces `TRUST_DOWNSTREAM_PROXY`. See [Behind a CDN or load balancer](#behind-a-cdn-or-load-balancer). |
+| `REAL_IP_HEADER` | `CF-Connecting-IP` with `cloudflare` in `TRUSTED_PROXIES`, else `X-Forwarded-For` | Header the trusted proxies put the client address in. |
 | `TRUST_DOWNSTREAM_PROXY` | `true` | Forward client-supplied `X-Forwarded-*` headers. Set to `false` unless another proxy sits in front: the headers, `X-Forwarded-For` included, are then set from the connection alone. Ignored when `TRUSTED_PROXIES` is set. |
 | `TRUST_DEFAULT_CERT` | `true` | Use `default.crt` for hosts without their own certificate. |
 | `ENABLE_HTTP_ON_MISSING_CERT` | `true` | |
@@ -173,25 +173,43 @@ When Cloudflare, a load balancer or another proxy sits in front, list it in
       TRUSTED_PROXIES: cloudflare            # or e.g. 10.0.0.0/8,192.0.2.10
 ```
 
-For a request that comes from one of the listed ranges, the proxy:
+For a request from a proxy **listed by address or range** (your own load
+balancer), the proxy:
 
 - takes the client address from `X-Forwarded-For` (or `REAL_IP_HEADER`),
-  skipping the trusted addresses from the right, so addresses a client put
-  in front are ignored. It becomes `$remote_addr`, so the access log,
+  skipping trusted addresses from the right, so addresses a client put in
+  front are ignored. It becomes `$remote_addr`, so the access log,
   `NETWORK_ACCESS=internal` and the `X-Real-IP` and `X-Forwarded-For` headers
   sent to your application all show the real client;
 - passes on `X-Forwarded-Proto` (`http` or `https` only), `-Host` and `-Port`.
+
+**`cloudflare`** trusts less, because Cloudflare's addresses are shared by
+every Cloudflare customer: anyone can add a zone of their own that points at
+your server's address and send requests from Cloudflare with headers of
+their choosing. From these addresses the proxy only believes what Cloudflare
+sets itself: the client address in `CF-Connecting-IP` (the default
+`REAL_IP_HEADER` when `cloudflare` is listed) and `X-Forwarded-Proto`.
+`X-Forwarded-Host` and `-Port` come from the request itself.
 
 Any other request, such as one sent straight to your server's address to get
 around Cloudflare, gets its own address and this server's scheme, host and
 port, whatever headers it sends. Your application receives a single address
 in `X-Forwarded-For`: the client's, not the chain of proxies.
 
-With Cloudflare, use the SSL/TLS mode *Full (strict)*. In *Flexible* mode
-Cloudflare connects over plain HTTP, the proxy redirects it to HTTPS, and
-browsers end up in a redirect loop.
-The built-in Cloudflare ranges are updated in this repository when
-Cloudflare announces a change.
+To accept traffic only from your own Cloudflare zone, not from Cloudflare in
+general, use [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/),
+or turn on [Authenticated Origin Pulls](https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull/)
+with a certificate for your zone and require it in `vhost.d/<host>`:
+
+```nginx
+ssl_client_certificate /etc/nginx/certs/cloudflare-origin-pull.pem;
+ssl_verify_client on;
+```
+
+Use the SSL/TLS mode *Full (strict)*. In *Flexible* mode Cloudflare connects
+over plain HTTP, the proxy redirects it to HTTPS, and browsers end up in a
+redirect loop. The built-in Cloudflare ranges are updated in this repository
+when Cloudflare announces a change.
 
 ### Files
 

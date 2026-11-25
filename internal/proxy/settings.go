@@ -35,11 +35,11 @@ type Settings struct {
 	TrustDownstreamProxy    bool
 	PreferIPv6Network       bool
 
-	// TrustedProxies are the ranges of the proxies in front (TRUSTED_PROXIES).
-	// When set, they replace TrustDownstreamProxy: the client address is
-	// taken from RealIPHeader, and the X-Forwarded-* headers are believed,
-	// only for requests that come from one of these ranges.
-	TrustedProxies   []string
+	// TrustedProxies are the proxies in front (TRUSTED_PROXIES). When set,
+	// they replace TrustDownstreamProxy: the client address is taken from
+	// RealIPHeader, and X-Forwarded-* headers are believed, only for
+	// requests that come from them.
+	TrustedProxies   TrustedProxies
 	RealIPHeader     string
 	SHA1UpstreamName bool
 
@@ -69,11 +69,11 @@ func SettingsFromEnv(env map[string]string) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	realIPHeader, err := ParseRealIPHeader(env["REAL_IP_HEADER"])
+	realIPHeader, err := ParseRealIPHeader(env["REAL_IP_HEADER"], trusted)
 	if err != nil {
 		return Settings{}, err
 	}
-	if len(trusted) > 0 && parseBool(env, "TRUST_DOWNSTREAM_PROXY", false) {
+	if !trusted.Empty() && parseBool(env, "TRUST_DOWNSTREAM_PROXY", false) {
 		warn("TRUST_DOWNSTREAM_PROXY=true is ignored: TRUSTED_PROXIES decides which forwarded headers are believed")
 	}
 	return Settings{
