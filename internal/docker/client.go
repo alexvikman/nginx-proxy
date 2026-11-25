@@ -207,13 +207,18 @@ func (c *Client) Inspect(ctx context.Context, id string) (*Container, error) {
 	return &ctr, nil
 }
 
+// EventFilters selects the events nginx-proxy reacts to.
+func EventFilters() map[string][]string {
+	return map[string][]string{
+		"type":  {"container", "network"},
+		"event": {"start", "die", "destroy", "pause", "unpause", "connect", "disconnect"},
+	}
+}
+
 // Events streams container and network events until ctx is cancelled or the
 // connection drops. fn is called for each event.
 func (c *Client) Events(ctx context.Context, fn func(Event)) error {
-	filters, _ := json.Marshal(map[string][]string{
-		"type":  {"container", "network"},
-		"event": {"start", "die", "destroy", "pause", "unpause", "connect", "disconnect"},
-	})
+	filters, _ := json.Marshal(EventFilters())
 	q := url.Values{"filters": {string(filters)}}
 	resp, err := c.get(ctx, "/events", q)
 	if err != nil {

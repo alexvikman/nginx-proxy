@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -70,10 +71,17 @@ func fakeDocker(t *testing.T) (*httptest.Server, *recorder) {
 	return srv, seen
 }
 
-func newProxy(t *testing.T) (*httptest.Server, *recorder) {
+// newProxy starts a socket proxy in front of a fake Docker daemon. filters
+// is its DOCKER_CONTAINER_FILTERS.
+func newProxy(t *testing.T, filters map[string][]string) (*httptest.Server, *recorder) {
 	t.Helper()
 	docker, seen := fakeDocker(t)
-	h, err := New("tcp://"+strings.TrimPrefix(docker.URL, "http://"), []string{"VIRTUAL_HOST", "VIRTUAL_PORT"}, "com.github.nginx-proxy.nginx-proxy.", "1.2.3")
+	h, err := New("tcp://"+strings.TrimPrefix(docker.URL, "http://"), Options{
+		EnvKeys:          []string{"VIRTUAL_HOST", "VIRTUAL_PORT"},
+		LabelPrefix:      "com.github.nginx-proxy.nginx-proxy.",
+		ContainerFilters: filters,
+		Version:          "1.2.3",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +91,7 @@ func newProxy(t *testing.T) (*httptest.Server, *recorder) {
 }
 
 func TestTheClientWorksThroughTheProxy(t *testing.T) {
-	srv, _ := newProxy(t)
+	srv, _ := newProxy(t, map[string][]string{"label": {"proxy=yes"}})
 	cli, err := docker.New("tcp://" + strings.TrimPrefix(srv.URL, "http://"))
 	if err != nil {
 		t.Fatal(err)
@@ -115,7 +123,7 @@ func TestTheClientWorksThroughTheProxy(t *testing.T) {
 }
 
 func TestSecretsAreStripped(t *testing.T) {
-	srv, _ := newProxy(t)
+	srv, _ := newProxy(t, nil)
 	for _, path := range []string{"/containers/json", "/containers/abc123/json"} {
 		resp, err := http.Get(srv.URL + path)
 		if err != nil {
@@ -146,8 +154,9 @@ func fetch(t *testing.T, url string) string {
 }
 
 func TestEventsCarryOnlyWhatIsRead(t *testing.T) {
-	srv, seen := newProxy(t)
-	resp, err := http.Get(srv.URL + `/events?filters={"type":["container"]}`)
+	srv, seen := newProxy(t, nil)
+	// The client's own filters, in another order: accepted.
+	resp, err := http.Get(srv.URL + `/events?filters={"event":["start","die","destroy","pause","unpause","connect","disconnect"],"type":["network","container"]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,13 +178,18 @@ func TestEventsCarryOnlyWhatIsRead(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &ev); err != nil || ev.Type != "container" || ev.Action != "start" || ev.Actor.ID != "abc123" {
 		t.Fatalf("event fields were lost: %s", lines[0])
 	}
-	if got := seen.all(); len(got) != 1 || !strings.Contains(got[0], "filters=") {
-		t.Errorf("filters must be forwarded, Docker got %s", got)
+	got := seen.all()
+	if len(got) != 1 {
+		t.Fatalf("want one events request at Docker, got %v", got)
+	}
+	u, _ := url.ParseRequestURI(strings.TrimPrefix(got[0], "GET "))
+	if f := u.Query().Get("filters"); f != canonicalFilters(docker.EventFilters()) {
+		t.Errorf("Docker must get the fixed event filters, got %q", f)
 	}
 }
 
 func TestOtherRequestsAreBlocked(t *testing.T) {
-	srv, seen := newProxy(t)
+	srv, seen := newProxy(t, nil)
 	for _, tc := range []struct{ method, path string }{
 		{"POST", "/containers/create"},
 		{"POST", "/containers/abc123/start"},
@@ -191,6 +205,11 @@ func TestOtherRequestsAreBlocked(t *testing.T) {
 		{"GET", "/containers/json?all=1"},
 		{"GET", "/containers/json?filters=x"},
 		{"GET", "/containers/json?filters={}&filters={}"},
+		// Filters would reveal stripped labels and images one guess at a time.
+		{"GET", `/containers/json?filters={"label":["com.example.secret=s3cr3t"]}`},
+		{"GET", `/containers/json?filters={"ancestor":["registry.example/app"]}`},
+		{"GET", `/events?filters={"label":["com.example.secret=s3cr3t"]}`},
+		{"GET", `/events?filters={"type":["container"]}`},
 		{"GET", "/containers/abc123/json?size=1"},
 		{"GET", "/containers/../info"},
 		{"GET", "/containers/abc%2F..%2F..%2Finfo/json"},
@@ -213,5 +232,37 @@ func TestOtherRequestsAreBlocked(t *testing.T) {
 	}
 	if got := seen.all(); len(got) != 0 {
 		t.Errorf("blocked requests reached Docker: %v", got)
+	}
+}
+
+func TestTheSocketProxyChoosesTheFilters(t *testing.T) {
+	srv, seen := newProxy(t, map[string][]string{"label": {"b=2", "a=1"}})
+	for _, tc := range []struct {
+		query string
+		want  int
+	}{
+		{"", http.StatusOK},
+		{`?filters={"label":["a=1","b=2"]}`, http.StatusOK},
+		{`?filters={"label":["a=1"]}`, http.StatusForbidden},
+		{`?filters={"label":["a=1","b=2"],"name":["x"]}`, http.StatusForbidden},
+	} {
+		resp, err := http.Get(srv.URL + "/containers/json" + tc.query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Errorf("list%s: got %d, want %d", tc.query, resp.StatusCode, tc.want)
+		}
+	}
+	got := seen.all()
+	if len(got) != 2 {
+		t.Fatalf("want 2 lists to reach Docker, got %v", got)
+	}
+	for _, r := range got {
+		u, _ := url.ParseRequestURI(strings.TrimPrefix(r, "GET "))
+		if f := u.Query().Get("filters"); f != `{"label":["a=1","b=2"]}` {
+			t.Errorf("Docker must get the socket proxy's filters, got %q", f)
+		}
 	}
 }

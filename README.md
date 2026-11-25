@@ -169,7 +169,7 @@ that container, which must be visible to the proxy.
 | Variable | Default | Description |
 |---|---|---|
 | `DOCKER_HOST` | `unix:///tmp/docker.sock` | Docker API endpoint (`unix://` or plain `tcp://`). |
-| `DOCKER_CONTAINER_FILTERS` | | Comma-separated `key=value` Docker list filters. |
+| `DOCKER_CONTAINER_FILTERS` | | Comma-separated `key=value` Docker list filters. With the [socket proxy](#socket-proxy), set the same value on it. |
 | `DEFAULT_HOST` | | Host served for unknown host names. |
 | `DEFAULT_ROOT` | `404` | `return` value when no container serves `/`, or `none`. |
 | `HTTPS_METHOD` | `redirect` | Default for all hosts. |
@@ -298,6 +298,12 @@ The [quick start](#quick-start) and
 socket and no published port, and the proxy reaches it with
 `DOCKER_HOST=tcp://socket-proxy:2375` over an `internal` network that only
 the two share.
+
+The socket proxy also decides which containers are listed and which events
+are sent: a client cannot pass its own filters, which could otherwise test
+for a label or image the responses leave out. Set `DOCKER_CONTAINER_FILTERS`
+on the socket proxy, and the same value on the proxy. When the two differ,
+the socket proxy refuses the list and both log why.
 
 The socket proxy listens on `SOCKET_PROXY_LISTEN` (default `:2375`) without
 TLS or authentication. Publish no port for it and keep it on an `internal`

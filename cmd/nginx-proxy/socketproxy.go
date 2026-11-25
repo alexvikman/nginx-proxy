@@ -31,7 +31,12 @@ func runSocketProxy() error {
 	if listen == "" {
 		listen = ":2375"
 	}
-	h, err := socketproxy.New(dockerHost, proxy.ContainerEnv, proxy.LabelPrefix, os.Getenv("NGINX_PROXY_VERSION"))
+	h, err := socketproxy.New(dockerHost, socketproxy.Options{
+		EnvKeys:          proxy.ContainerEnv,
+		LabelPrefix:      proxy.LabelPrefix,
+		ContainerFilters: docker.ParseFilters(os.Getenv("DOCKER_CONTAINER_FILTERS")),
+		Version:          os.Getenv("NGINX_PROXY_VERSION"),
+	})
 	if err != nil {
 		return err
 	}
@@ -52,7 +57,8 @@ func runSocketProxy() error {
 		defer cancel()
 		_ = srv.Shutdown(sctx)
 	}()
-	slog.Info("socket proxy started", "version", os.Getenv("NGINX_PROXY_VERSION"), "listen", ln.Addr().String(), "docker", dockerHost)
+	slog.Info("socket proxy started", "version", os.Getenv("NGINX_PROXY_VERSION"), "listen", ln.Addr().String(), "docker", dockerHost,
+		"container_filters", os.Getenv("DOCKER_CONTAINER_FILTERS"))
 	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

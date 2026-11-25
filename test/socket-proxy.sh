@@ -96,6 +96,9 @@ for req in "POST /containers/create" "POST /containers/$RUN_ID-app/stop" "GET /i
 	if [[ "$code" == 403 || "$code" == 405 ]]; then ok "refuses $req"; else fail "$req: want 403 or 405, got $code"; fi
 done
 [[ "$(docker inspect -f '{{.State.Running}}' "$RUN_ID-app")" == true ]] || fail "the backend was stopped"
+# A client-chosen filter would tell whether the hidden label has this value.
+code="$(kurl -o /dev/null -w '%{http_code}' -G --data-urlencode 'filters={"label":["com.example.token=label-secret"]}' "http://socket-proxy:2375/containers/json")"
+if [[ "$code" == 403 ]]; then ok "refuses client-chosen list filters"; else fail "client-chosen list filters: want 403, got $code"; fi
 
 logs="$(docker logs "$RUN_ID-proxy" 2>&1)"
 if [[ "$logs" == *"could not determine nginx-proxy's own container"* ]]; then

@@ -56,39 +56,93 @@ func FilterID(envKeys []string, labelPrefix string) string {
 // inspect: no slashes, dots only after the first character.
 var containerRef = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
 
+// Options configure a Handler.
+type Options struct {
+	// EnvKeys are the container environment variables passed on; all
+	// others are dropped.
+	EnvKeys []string
+	// LabelPrefix is the prefix of the container labels passed on.
+	LabelPrefix string
+	// ContainerFilters are the Docker list filters (DOCKER_CONTAINER_FILTERS)
+	// applied to every container list. A client cannot choose others.
+	ContainerFilters map[string][]string
+	// Version is reported in VersionHeader.
+	Version string
+}
+
 // Handler forwards allowed requests to the Docker API.
 type Handler struct {
 	client      *http.Client
 	base        string
 	envKeys     map[string]bool
 	labelPrefix string
-	filterID    string
-	version     string
-	slots       chan struct{}
+	// listFilters and eventFilters are the canonical "filters" values sent
+	// to Docker; "" for none. Clients cannot choose their own: filters on
+	// labels or images would reveal what the responses leave out, one
+	// guess at a time.
+	listFilters  string
+	eventFilters string
+	filterID     string
+	version      string
+	slots        chan struct{}
 }
 
 // New returns a Handler that forwards to dockerHost (DOCKER_HOST syntax).
-// Only container environment variables named in envKeys, and labels that
-// start with labelPrefix, are passed on. version is reported in
-// VersionHeader.
-func New(dockerHost string, envKeys []string, labelPrefix, version string) (*Handler, error) {
+func New(dockerHost string, o Options) (*Handler, error) {
 	client, base, err := docker.NewHTTP(dockerHost)
 	if err != nil {
 		return nil, err
 	}
-	keys := make(map[string]bool, len(envKeys))
-	for _, k := range envKeys {
+	keys := make(map[string]bool, len(o.EnvKeys))
+	for _, k := range o.EnvKeys {
 		keys[k] = true
 	}
 	return &Handler{
-		client:      client,
-		base:        base,
-		envKeys:     keys,
-		labelPrefix: labelPrefix,
-		filterID:    FilterID(envKeys, labelPrefix),
-		version:     version,
-		slots:       make(chan struct{}, maxInFlight),
+		client:       client,
+		base:         base,
+		envKeys:      keys,
+		labelPrefix:  o.LabelPrefix,
+		listFilters:  canonicalFilters(o.ContainerFilters),
+		eventFilters: canonicalFilters(docker.EventFilters()),
+		filterID:     FilterID(o.EnvKeys, o.LabelPrefix),
+		version:      o.Version,
+		slots:        make(chan struct{}, maxInFlight),
 	}, nil
+}
+
+// canonicalFilters encodes f so that equal filters encode equally: keys
+// sorted (encoding/json sorts map keys), values sorted, empty lists dropped.
+func canonicalFilters(f map[string][]string) string {
+	c := make(map[string][]string, len(f))
+	for k, v := range f {
+		if len(v) > 0 {
+			c[k] = slices.Sorted(slices.Values(v))
+		}
+	}
+	if len(c) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(c)
+	return string(b)
+}
+
+// filtersAre reports whether the request's "filters" parameter is absent or
+// the same filters as want.
+func filtersAre(q url.Values, want string) bool {
+	v, ok := q["filters"]
+	if !ok {
+		return true
+	}
+	var f map[string][]string
+	return json.Unmarshal([]byte(v[0]), &f) == nil && canonicalFilters(f) == want
+}
+
+// withFilters returns the query for a canonical filters value.
+func withFilters(f string) url.Values {
+	if f == "" {
+		return nil
+	}
+	return url.Values{"filters": {f}}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -117,8 +171,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == "/_ping" && onlyParams(r.URL.Query()):
 		h.ping(w, r)
 	case path == "/containers/json" && onlyParams(r.URL.Query(), "filters"):
+		if !filtersAre(r.URL.Query(), h.listFilters) {
+			slog.Warn("blocked container list with other filters than the socket proxy's DOCKER_CONTAINER_FILTERS; set the same value on both containers", "remote", r.RemoteAddr)
+			writeError(w, http.StatusForbidden, "container filters differ from the socket proxy's DOCKER_CONTAINER_FILTERS")
+			return
+		}
 		h.list(w, r)
-	case path == "/events" && onlyParams(r.URL.Query(), "filters"):
+	case path == "/events" && onlyParams(r.URL.Query(), "filters") && filtersAre(r.URL.Query(), h.eventFilters):
 		h.events(w, r)
 	default:
 		ref, ok := strings.CutPrefix(path, "/containers/")
@@ -215,7 +274,7 @@ func (h *Handler) ping(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
-	resp := h.forward(ctx, w, "/containers/json", r.URL.Query())
+	resp := h.forward(ctx, w, "/containers/json", withFilters(h.listFilters))
 	if resp == nil {
 		return
 	}
@@ -258,7 +317,7 @@ func (h *Handler) inspect(w http.ResponseWriter, r *http.Request, ref string) {
 }
 
 func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
-	resp := h.forward(r.Context(), w, "/events", r.URL.Query())
+	resp := h.forward(r.Context(), w, "/events", withFilters(h.eventFilters))
 	if resp == nil {
 		return
 	}
