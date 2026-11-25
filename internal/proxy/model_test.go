@@ -31,7 +31,13 @@ func ctr(name string, env map[string]string, labels map[string]string, nets map[
 	return c
 }
 
-func defaults() Settings { return SettingsFromEnv(map[string]string{}) }
+func defaults() Settings {
+	s, err := SettingsFromEnv(map[string]string{})
+	if err != nil {
+		panic(err)
+	}
+	return s
+}
 
 func render(t *testing.T, cfg *Config) string {
 	t.Helper()

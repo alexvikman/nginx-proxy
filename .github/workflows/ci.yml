@@ -75,3 +75,5 @@ jobs:
         run: test/acme.sh nginx-proxy:test
       - name: Docker API through the socket proxy
         run: test/socket-proxy.sh nginx-proxy:test
+      - name: Forwarded headers from TRUSTED_PROXIES
+        run: test/trusted-proxies.sh nginx-proxy:test

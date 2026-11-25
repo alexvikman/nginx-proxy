@@ -63,7 +63,14 @@ type Settings struct {
 	TrustDefaultCert        bool
 	TrustDownstreamProxy    bool
 	PreferIPv6Network       bool
-	SHA1UpstreamName        bool
+
+	// TrustedProxies are the proxies in front (TRUSTED_PROXIES). When set,
+	// they replace TrustDownstreamProxy: the client address is taken from
+	// RealIPHeader, and X-Forwarded-* headers are believed, only for
+	// requests that come from them.
+	TrustedProxies   TrustedProxies
+	RealIPHeader     string
+	SHA1UpstreamName bool
 
 	// Built-in ACME client.
 	ACMEEnabled  bool
@@ -78,13 +85,25 @@ const (
 )
 
 // SettingsFromEnv reads Settings from an environment map, using the same
-// variable names and defaults as upstream nginx-proxy.
-func SettingsFromEnv(env map[string]string) Settings {
+// variable names and defaults as upstream nginx-proxy. It fails only for
+// settings that would otherwise leave the proxy less secure than asked for.
+func SettingsFromEnv(env map[string]string) (Settings, error) {
 	str := func(k, def string) string {
 		if v := strings.TrimSpace(env[k]); v != "" {
 			return v
 		}
 		return def
+	}
+	trusted, err := ParseTrustedProxies(env["TRUSTED_PROXIES"])
+	if err != nil {
+		return Settings{}, err
+	}
+	realIPHeader, err := ParseRealIPHeader(env["REAL_IP_HEADER"], trusted)
+	if err != nil {
+		return Settings{}, err
+	}
+	if !trusted.Empty() && parseBool(env, "TRUST_DOWNSTREAM_PROXY", false) {
+		warn("TRUST_DOWNSTREAM_PROXY=true is ignored: TRUSTED_PROXIES decides which forwarded headers are believed")
 	}
 	return Settings{
 		Version:                 str("NGINX_PROXY_VERSION", "dev"),
@@ -113,7 +132,9 @@ func SettingsFromEnv(env map[string]string) Settings {
 		ACMEEnabled:             parseBool(env, "ENABLE_ACME", true),
 		ACMECAURI:               str("ACME_CA_URI", LetsEncryptProduction),
 		DefaultEmail:            str("DEFAULT_EMAIL", ""),
-	}
+		TrustedProxies:          trusted,
+		RealIPHeader:            realIPHeader,
+	}, nil
 }
 
 func parseBool(env map[string]string, key string, def bool) bool {
