@@ -9,6 +9,35 @@ import (
 // Label prefix shared with upstream nginx-proxy, kept for drop-in compatibility.
 const labelPrefix = "com.github.nginx-proxy.nginx-proxy."
 
+// LabelPrefix is the prefix of every container label Build reads.
+const LabelPrefix = labelPrefix
+
+// ContainerEnv lists every environment variable of a proxied container that
+// Build reads. The socket proxy passes on only these, so other variables,
+// such as passwords, never reach nginx-proxy. A test keeps the list complete.
+var ContainerEnv = []string{
+	"ACME_HTTP_CHALLENGE_LOCATION",
+	"CERT_NAME",
+	"ENABLE_HTTP_ON_MISSING_CERT",
+	"EXTERNAL_HTTPS_PORT",
+	"EXTERNAL_HTTP_PORT",
+	"HSTS",
+	"HTTPS_METHOD",
+	"LETSENCRYPT_EMAIL",
+	"LETSENCRYPT_HOST",
+	"LETSENCRYPT_TEST",
+	"NETWORK_ACCESS",
+	"SERVER_TOKENS",
+	"SSL_POLICY",
+	"VIRTUAL_DEST",
+	"VIRTUAL_HOST",
+	"VIRTUAL_HOST_MULTIPORTS",
+	"VIRTUAL_PATH",
+	"VIRTUAL_PORT",
+	"VIRTUAL_PROTO",
+	"VIRTUAL_ROOT",
+}
+
 // Settings are the proxy-wide options, read from the proxy container's environment.
 type Settings struct {
 	Version string

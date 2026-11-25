@@ -33,6 +33,15 @@ const (
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	run := run
+	switch {
+	case len(os.Args) < 2:
+	case os.Args[1] == "socket-proxy" && len(os.Args) == 2:
+		run = runSocketProxy
+	default:
+		fmt.Fprintf(os.Stderr, "usage: %s [socket-proxy]\n", os.Args[0])
+		os.Exit(2)
+	}
 	if err := run(); err != nil {
 		slog.Error("nginx-proxy stopped", "err", err)
 		os.Exit(1)
@@ -80,6 +89,8 @@ func run() error {
 	if err := waitForDocker(ctx, cli); err != nil {
 		return err
 	}
+	socketCheck := newFilterCheck(settings.Version)
+	socketCheck.run(ctx, cli)
 	selfID := docker.SelfID(ctx, cli)
 	if selfID == "" {
 		slog.Warn("could not determine nginx-proxy's own container; every container network will be considered reachable")
@@ -134,6 +145,7 @@ func run() error {
 			}
 			return fmt.Errorf("nginx exited: %w", err)
 		case <-ticker.C:
+			socketCheck.run(ctx, cli)
 			sync()
 		case <-trigger:
 			// Collapse bursts of events (e.g. compose up) into one render.
@@ -291,7 +303,7 @@ func watchEvents(ctx context.Context, cli *docker.Client, kick func()) {
 func waitForDocker(ctx context.Context, cli *docker.Client) error {
 	for i := 0; ; i++ {
 		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := cli.Ping(pctx)
+		_, err := cli.Ping(pctx)
 		cancel()
 		if err == nil {
 			return nil

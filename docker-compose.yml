@@ -1,19 +1,41 @@
 # Example: proxy plus one routed service with an automatic certificate.
+#
+# The Docker socket is only mounted into socket-proxy, which has no published
+# port and only answers the four read requests the proxy makes. The proxy,
+# which handles the traffic, reaches it over an internal network. See
+# "Security" in the README.
 services:
+  socket-proxy:
+    image: ghcr.io/alexvikman/nginx-proxy:latest
+    command: socket-proxy
+    networks:
+      - docker-api
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    restart: unless-stopped
+
   proxy:
     image: ghcr.io/alexvikman/nginx-proxy:latest
+    networks:
+      - default
+      - docker-api
     ports:
       - "80:80"
       - "443:443"
     environment:
+      DOCKER_HOST: tcp://socket-proxy:2375
       DEFAULT_EMAIL: ops@example.com
       TRUST_DOWNSTREAM_PROXY: "false"
     volumes:
-      - /var/run/docker.sock:/tmp/docker.sock:ro
       - certs:/etc/nginx/certs
       - vhost:/etc/nginx/vhost.d
     # Everything the proxy needs: binding ports 80/443 and starting the nginx
-    # workers as an unprivileged user. See "Security" in the README.
+    # workers as an unprivileged user.
     cap_drop:
       - ALL
     cap_add:
@@ -23,6 +45,8 @@ services:
       - NET_BIND_SERVICE
     security_opt:
       - no-new-privileges:true
+    depends_on:
+      - socket-proxy
     restart: unless-stopped
 
   whoami:
@@ -30,6 +54,11 @@ services:
     environment:
       VIRTUAL_HOST: whoami.example.com
       LETSENCRYPT_HOST: whoami.example.com
+
+networks:
+  # Only the proxy and the socket proxy are on it, and it has no route out.
+  docker-api:
+    internal: true
 
 volumes:
   certs:
