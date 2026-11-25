@@ -30,9 +30,19 @@ type Client struct {
 // New creates a client for host, which uses the DOCKER_HOST syntax
 // (unix:///path/to/docker.sock or tcp://host:port).
 func New(host string) (*Client, error) {
+	hc, base, err := NewHTTP(host)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{http: hc, base: base}, nil
+}
+
+// NewHTTP returns an HTTP client for host (DOCKER_HOST syntax) and the base
+// URL that request paths are appended to.
+func NewHTTP(host string) (*http.Client, string, error) {
 	u, err := url.Parse(host)
 	if err != nil {
-		return nil, fmt.Errorf("parse docker host %q: %w", host, err)
+		return nil, "", fmt.Errorf("parse docker host %q: %w", host, err)
 	}
 	switch u.Scheme {
 	case "unix":
@@ -43,11 +53,11 @@ func New(host string) (*Client, error) {
 				return d.DialContext(ctx, "unix", socket)
 			},
 		}
-		return &Client{http: &http.Client{Transport: tr}, base: "http://docker"}, nil
+		return &http.Client{Transport: tr}, "http://docker", nil
 	case "tcp", "http":
-		return &Client{http: &http.Client{}, base: "http://" + u.Host}, nil
+		return &http.Client{}, "http://" + u.Host, nil
 	default:
-		return nil, fmt.Errorf("unsupported docker host scheme %q (use unix:// or tcp://)", u.Scheme)
+		return nil, "", fmt.Errorf("unsupported docker host scheme %q (use unix:// or tcp://)", u.Scheme)
 	}
 }
 
@@ -145,14 +155,15 @@ func (c *Client) getJSON(ctx context.Context, path string, q url.Values, out any
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-// Ping checks that the daemon is reachable.
-func (c *Client) Ping(ctx context.Context) error {
+// Ping checks that the daemon is reachable and returns the response
+// headers, which identify a socket proxy in between.
+func (c *Client) Ping(ctx context.Context) (http.Header, error) {
 	resp, err := c.get(ctx, "/_ping", nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	resp.Body.Close()
-	return nil
+	return resp.Header, nil
 }
 
 // RunningContainers lists running containers matching filters and inspects each one.

@@ -29,17 +29,35 @@ ghcr.io/alexvikman/nginx-proxy:latest
 
 ```yaml
 services:
+  # The only container with the Docker socket. It answers the four read
+  # requests the proxy makes and has no published port.
+  socket-proxy:
+    image: ghcr.io/alexvikman/nginx-proxy:latest
+    command: socket-proxy
+    networks: [docker-api]
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    restart: unless-stopped
+
   proxy:
     image: ghcr.io/alexvikman/nginx-proxy:latest
+    networks: [default, docker-api]
     ports:
       - "80:80"
       - "443:443"
     environment:
+      DOCKER_HOST: tcp://socket-proxy:2375
       DEFAULT_EMAIL: ops@example.com
       TRUST_DOWNSTREAM_PROXY: "false" # no other proxy in front of this one
     volumes:
-      - /var/run/docker.sock:/tmp/docker.sock:ro
       - certs:/etc/nginx/certs
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID, NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    depends_on: [socket-proxy]
     restart: unless-stopped
 
   whoami:
@@ -48,19 +66,35 @@ services:
       VIRTUAL_HOST: whoami.example.com
       LETSENCRYPT_HOST: whoami.example.com
 
+networks:
+  docker-api:
+    internal: true
+
 volumes:
   certs:
 ```
 
 The proxy can only reach containers that share a Docker network with it. In
-the example above, Compose puts both services on the same default network.
-
-[`docker-compose.yml`](docker-compose.yml) is the same setup with reduced
-container privileges. See [Security](#security) before exposing the proxy.
+the example above, Compose puts `proxy` and `whoami` on the same default
+network. The Docker socket stays out of the container that handles traffic:
+see [Socket proxy](#socket-proxy). The same setup is in
+[`docker-compose.yml`](docker-compose.yml). Run both containers from the
+same image tag. See [Security](#security) before exposing the proxy.
 
 ## Moving from nginx-proxy/nginx-proxy
 
-1. Replace the image with `ghcr.io/alexvikman/nginx-proxy:latest`.
+1. Replace the image with `ghcr.io/alexvikman/nginx-proxy:latest`. The
+   Docker socket mounted into the proxy works as before:
+
+   ```yaml
+     proxy:
+       image: ghcr.io/alexvikman/nginx-proxy:latest
+       volumes:
+         - /var/run/docker.sock:/tmp/docker.sock:ro
+   ```
+
+   Moving the socket to a [socket proxy](#socket-proxy) can be done
+   afterwards, as in the [quick start](#quick-start).
 2. Keep your volumes. `/etc/nginx/certs`, `vhost.d`, `htpasswd`, `conf.d` and
    `toplevel.conf.d` are read from the same paths.
 3. If you use **acme-companion**, either:
@@ -213,14 +247,14 @@ what the proxy considers with `DOCKER_CONTAINER_FILTERS`.
 **Docker socket.** The proxy only reads from the Docker API: `GET /_ping`,
 `/containers/json`, `/containers/<id>/json` and `/events`. Mounting the socket
 with `:ro` does not limit the API, and access to it amounts to root on the
-host. The proxy process and the nginx master run as root. The nginx workers,
-which handle the traffic, run as the `nginx` user and must not be able to
-open the socket: the proxy logs a warning at startup when they can, which is
-the case for a world-writable socket or a socket group with the id of the
-image's `nginx` group. To limit what a compromised proxy could do, put a
-filtering socket proxy in front that only allows those four requests, and
-point `DOCKER_HOST` (`tcp://host:port`) at it over a network that only the
-two share: the connection is not encrypted.
+host. Use the [socket proxy](#socket-proxy) so that the container which
+handles traffic does not have the socket at all.
+
+When the socket is mounted into the proxy, the proxy process and the nginx
+master run as root. The nginx workers, which handle the traffic, run as the
+`nginx` user and must not be able to open the socket: the proxy logs a
+warning at startup when they can, which is the case for a world-writable
+socket or a socket group with the id of the image's `nginx` group.
 
 **Container privileges.** The proxy needs four capabilities: to bind ports
 80 and 443, and to start the nginx workers as an unprivileged user.
@@ -248,6 +282,37 @@ proxy sets these headers.
 arrives from a private address and is let in. Check the access log for real
 client addresses before relying on it.
 
+### Socket proxy
+
+The same image runs as a filtering Docker API proxy with the `socket-proxy`
+command. It answers the four requests above and refuses everything else, so
+a compromised proxy cannot start, stop or exec into containers. It also
+rebuilds every response from the fields the proxy reads: of other
+containers' environment variables only those in
+[Proxied containers](#proxied-containers) are passed on, of their labels only
+`com.github.nginx-proxy.nginx-proxy.*`, and mounts, commands and the like not
+at all. Passwords in other containers' environments do not reach the proxy.
+
+The [quick start](#quick-start) and
+[`docker-compose.yml`](docker-compose.yml) set it up: the socket proxy has the
+socket and no published port, and the proxy reaches it with
+`DOCKER_HOST=tcp://socket-proxy:2375` over an `internal` network that only
+the two share.
+
+The socket proxy listens on `SOCKET_PROXY_LISTEN` (default `:2375`) without
+TLS or authentication. Publish no port for it and keep it on an `internal`
+network that only the proxy shares. Any container on that network can make
+the four requests.
+
+A proxy with `network_mode: host` cannot join an internal network. Either
+publish the socket proxy on `127.0.0.1` only, which lets every process on the
+host make the four requests, or mount the socket into the proxy.
+
+Run the proxy and the socket proxy from the same image tag. The socket
+proxy passes on only the variables its version knows, so an older socket
+proxy would hide a variable a newer proxy reads. The proxy compares the two
+at startup and every 30 seconds, and logs an error when they differ.
+
 ## Not supported yet
 
 - `VIRTUAL_HOST_MULTIPORTS` (a warning is logged and `VIRTUAL_HOST` is used)
@@ -255,7 +320,9 @@ client addresses before relying on it.
 - HTTP/3, OCSP stapling, PROXY protocol, the debug endpoint
 - AWS `SSL_POLICY` presets (anything other than the Mozilla policies falls
   back to `Mozilla-Intermediate`)
-- the separate-containers (docker-gen) mode
+- the separate-containers (docker-gen) mode. Its purpose, keeping the Docker
+  socket out of the container that handles traffic, is served by the
+  [socket proxy](#socket-proxy).
 - Docker API over TLS (`DOCKER_TLS_VERIFY`)
 
 Differences from upstream: `server_tokens` defaults to `off`, and no DH
@@ -302,12 +369,14 @@ go test ./...                       # unit tests
 docker build -t nginx-proxy:test .  # image
 test/integration.sh                 # routing, TLS, events, rollback
 test/acme.sh                        # ACME against Pebble
+test/socket-proxy.sh                # Docker API through the socket proxy
 ```
 
 Code layout:
 
 - `cmd/nginx-proxy`: wiring, event loop, signal handling
 - `internal/docker`: minimal Docker Engine API client
+- `internal/socketproxy`: filtering Docker API proxy (`socket-proxy` command)
 - `internal/proxy`: containers to config model, plus the nginx template
 - `internal/nginx`: nginx process, `nginx -t` with rollback, reload
 - `internal/acme`: HTTP-01 certificate issuance and renewal
